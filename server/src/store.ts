@@ -21,9 +21,9 @@ import {
   ROUTING_STRATEGIES,
   canJoinPool,
   createMetrics,
+  isDetached,
   isServing,
-  kindCounts,
-  layoutSlotFor,
+  layoutColumnX,
   type AccountEntity,
   type AccountType,
   type CredentialType,
@@ -925,20 +925,67 @@ export class GraphStore {
   }
 
   /**
-   * Next free canvas slot of the kind's band, laid out like the seed data.
-   *
-   * `layoutSlotFor` recomputes the whole band geometry for `count + 1` while
-   * the entities already on the canvas still sit on the geometry computed for
-   * `count` — and an operator may have dragged them anywhere at all. So the
-   * candidate slot is only a starting point: push it down until its rect is
-   * clear of every existing card.
+   * Home for a freshly created entity, matching the shared layered-DAG layout
+   * (`layoutPositions`): a new attached entity appends to the BOTTOM of its
+   * kind's single column. Pools, accounts and proxies are born DETACHED (no
+   * upstream relation yet), so they land where the layout parks detached
+   * nodes — below the live graph, x-aligned with their own column; new
+   * accounts continue the parked block's lane grid. The operator may have
+   * dragged cards anywhere at all, so the candidate is only a starting point:
+   * push it down until its rect is clear of every existing card.
    */
   private nextFreePosition(kind: EntityKind): XY {
-    const candidate = layoutSlotFor(kindCounts(this.state), kind, this.listOf(kind).length)
+    const colX = layoutColumnX()
     const width = LAYOUT.nodeWidth[kind]
     const height = LAYOUT.nodeHeight[kind]
     const step = height + LAYOUT.rowGap
     const existing = this.all()
+
+    // Bottom of this kind's column (parked cards included).
+    let y = LAYOUT.topY
+    for (const entity of existing) {
+      if (entity.kind !== kind) continue
+      y = Math.max(y, entity.position.y + height + LAYOUT.rowGap)
+    }
+    const candidate: XY = { x: colX[kind], y }
+
+    if (kind !== 'key') {
+      // Born detached: never above the parking line under the live graph.
+      let attachedBottom = LAYOUT.topY
+      for (const entity of existing) {
+        if (entity.kind !== 'gateway' && isDetached(this.state, entity)) continue
+        attachedBottom = Math.max(
+          attachedBottom,
+          entity.position.y + LAYOUT.nodeHeight[entity.kind],
+        )
+      }
+      let parkLine = attachedBottom + LAYOUT.detachedGap
+      // Parked rows of every kind share ONE top line. Appending to an attached
+      // column (e.g. a freshly created key) can extend the live graph BELOW an
+      // already-established parked band; a new detached node must then JOIN
+      // that band's top row instead of opening a second parking line further
+      // down, so the baseline is clamped to the highest already-parked card.
+      // `layoutPositions` re-parks everything at one parkY on the next
+      // 自动布局 either way — this only keeps the interim picture coherent.
+      let parkedTop = Number.POSITIVE_INFINITY
+      for (const entity of existing) {
+        if (!isDetached(this.state, entity)) continue
+        parkedTop = Math.min(parkedTop, entity.position.y)
+      }
+      if (parkedTop !== Number.POSITIVE_INFINITY) parkLine = Math.min(parkLine, parkedTop)
+      candidate.y = Math.max(candidate.y, parkLine)
+      if (kind === 'account') {
+        // Continue the parked account block's lane grid: the i-th detached
+        // account sits in lane i % accountLanes of the parked block.
+        const parkedCount = this.state.accounts.filter((account) =>
+          isDetached(this.state, account),
+        ).length
+        const lane = parkedCount % LAYOUT.accountLanes
+        candidate.x += lane * (LAYOUT.nodeWidth.account + LAYOUT.laneGap)
+        // A lane to the right of an existing parked card shares its row.
+        if (lane > 0) candidate.y = Math.max(LAYOUT.topY, candidate.y - step)
+      }
+    }
 
     const collides = (pos: XY): boolean =>
       existing.some((entity) => {

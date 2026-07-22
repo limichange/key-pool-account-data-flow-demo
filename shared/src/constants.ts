@@ -148,37 +148,37 @@ export const MODELS = [
  * Canvas layout geometry shared by the auto-layout helper, the seed data and
  * the server-side placement of freshly created entities.
  *
+ * The canvas is a layered DAG read left to right — gateway | keys | pools |
+ * accounts | proxies. GATEWAY, KEY, POOL and PROXY are each exactly ONE
+ * vertical column and never wrap. ACCOUNTS are the only kind allowed to be a
+ * grid: each pool's accounts form one contiguous block wrapping at
+ * `accountLanes` columns, blocks stacked in pool order. `layoutPositions` in
+ * utils.ts is the single owner of the resulting geometry.
+ *
  * Cards are information dense and therefore tall; `nodeHeight` is the slot
  * height reserved for one card (a little larger than the tallest rendering of
  * that kind so a card that grows a banner still never overlaps its neighbour).
- * A kind whose column would grow past `maxRowsPerLane[kind]` wraps into extra
- * lanes inside its own band, which keeps the whole graph close to the aspect
- * ratio of the canvas instead of degenerating into one very tall strip.
  */
 export const LAYOUT = {
-  /** Horizontal gutter between two kind bands. */
+  /** Horizontal gutter between two kind columns. */
   columnGap: 96,
-  /** Horizontal gap between two lanes of the same kind. */
+  /** Horizontal gap between two account lanes inside the account band. */
   laneGap: 28,
-  /** Vertical gap between two cards in the same lane. */
+  /** Vertical gap between two cards in the same column / lane. */
   rowGap: 44,
   /**
-   * Cards stacked in one lane before the band wraps into another lane, PER KIND.
-   *
-   * Accounts outnumber every other kind roughly two to one (the seed ships 16 of
-   * them against 7/6/7), so they get the tallest lane: one deep account band and
-   * three shallow neighbours plus the single gateway column keep the seed graph
-   * at ~4340x2620 px, i.e. an aspect ratio of ~1.66 — comfortably inside the
-   * 1.3..1.9 window the canvas viewport wants. Giving accounts the same shallow
-   * lane as the rest would spread them over four lanes and blow the ratio.
-   *
-   * The gateway is a SINGLETON: one node, one lane, vertically centred on the
-   * whole graph by the band-centering in `layoutSlots`.
+   * Lanes of the ACCOUNT grid — the only kind that wraps (16 tall cards in one
+   * column would be absurd). Three lanes keep every seed pool block a single
+   * row (the pools own 3/3/3/2/2/2 accounts), which keeps the account band
+   * roughly as tall as the other columns; that vertical compression is what
+   * lets the pool/key/proxy barycentre alignment render the edges as
+   * near-horizontal flows instead of long diagonals.
    */
-  maxRowsPerLane: { gateway: 1, key: 3, pool: 3, account: 6, proxy: 3 } as Record<
-    EntityKind,
-    number
-  >,
+  accountLanes: 3,
+  /** Vertical gap between two per-pool account blocks (~rowGap * 1.5). */
+  blockGap: 66,
+  /** Vertical clearance between the live graph and the detached parking area. */
+  detachedGap: 120,
   topY: 0,
   nodeWidth: { gateway: 360, key: 300, pool: 320, account: 320, proxy: 300 } as Record<
     EntityKind,

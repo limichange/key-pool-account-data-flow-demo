@@ -169,73 +169,298 @@ export function canJoinPool(account: AccountEntity): boolean {
 
 /* ------------------------------------------------------------------ layout -- */
 
-export type KindCounts = Partial<Record<EntityKind, number>>
+/*
+ * Canonical canvas geometry — a layered DAG read left to right:
+ *
+ *   gateway | keys | pools | accounts | proxies
+ *
+ * GATEWAY, KEY, POOL and PROXY are each exactly ONE vertical column; they
+ * never wrap. ACCOUNTS are the only kind allowed to be a grid: each pool's
+ * accounts form one contiguous block wrapping at `LAYOUT.accountLanes`
+ * columns, blocks stacked in pool order with `LAYOUT.blockGap` between them,
+ * unassigned accounts parked below the live graph.
+ *
+ * Vertical placement expresses the relations: a pool sits across from the
+ * centre of its account block, keys sit at the barycentre of the pools they
+ * bind, the gateway centres on the key column and proxies sit at the
+ * barycentre of the accounts dialling them — so edges read as near-horizontal
+ * flows instead of long diagonals.
+ *
+ * `layoutPositions` is a pure function of the RELATIONS (state order, pool
+ * membership, key bindings, proxy usage) — never of the current positions —
+ * and the whole console shares it (seed data, server-side placement of new
+ * entities, the canvas 自动布局 button), so the three can never drift apart
+ * and 自动布局 on an untouched seed graph is an exact no-op.
+ */
+
+/** Width of one kind's band: a single card, except the account lane grid. */
+function bandWidth(kind: EntityKind): number {
+  if (kind === 'account') {
+    return (
+      LAYOUT.accountLanes * LAYOUT.nodeWidth.account + (LAYOUT.accountLanes - 1) * LAYOUT.laneGap
+    )
+  }
+  return LAYOUT.nodeWidth[kind]
+}
 
 /**
- * Canonical canvas geometry: one left-to-right band per kind, each band packed
- * into as many vertical lanes as it needs, every band vertically centred on the
- * tallest one. Slots are returned in the same order as the entities were
- * counted, so `slots[kind][i]` is the home of the i-th entity of that kind.
- *
- * The whole console shares this helper (seed data, the server's placement of
- * new entities and the canvas "auto layout" button) so the three can never
- * drift apart.
- *
- * Since Pool -> Account is one-to-many the pool->account edges form a forest,
- * so callers are expected to feed the accounts in owning-pool order (pools in
- * state order, unassigned accounts last). That ordering plus this geometry is
- * what removes almost every edge crossing in the account band.
+ * Fixed x of every kind's column (left edge; for accounts the left edge of
+ * lane 0). With single columns the band widths are constants, so the x values
+ * no longer depend on how many entities exist.
  */
-export function layoutSlots(counts: KindCounts): Record<EntityKind, XY[]> {
-  const bands = KIND_ORDER.map((kind) => {
-    const count = Math.max(0, Math.floor(counts[kind] ?? 0))
-    const lanes = Math.max(1, Math.ceil(count / Math.max(1, LAYOUT.maxRowsPerLane[kind])))
-    const rows = count > 0 ? Math.ceil(count / lanes) : 0
+export function layoutColumnX(): Record<EntityKind, number> {
+  const out = {} as Record<EntityKind, number>
+  let x = 0
+  for (const kind of KIND_ORDER) {
+    out[kind] = x
+    x += bandWidth(kind) + LAYOUT.columnGap
+  }
+  return out
+}
+
+/**
+ * 1-D overlap resolution for one column. Items arrive top-to-bottom with
+ * NON-DECREASING desired tops; the result keeps that order, spaces items at
+ * least `height + gap` apart and re-centres every run of colliding items on
+ * its members' targets — the classic priority / block-shift pass (walk down
+ * pushing on overlap, bottom-up relaxation), computed in one deterministic
+ * pool-adjacent-violators merge.
+ */
+function placeColumn(desiredTops: number[], height: number, gap: number): number[] {
+  const step = height + gap
+  interface Block {
+    start: number
+    count: number
+    /** Sum of the members' implied block-top targets (desired - offset). */
+    sum: number
+  }
+  const blocks: Block[] = []
+  desiredTops.forEach((desired, index) => {
+    let block: Block = { start: index, count: 1, sum: desired }
+    while (blocks.length > 0) {
+      const prev = blocks[blocks.length - 1]
+      if (prev.sum / prev.count + prev.count * step <= block.sum / block.count) break
+      blocks.pop()
+      block = {
+        start: prev.start,
+        count: prev.count + block.count,
+        sum: prev.sum + block.sum - block.count * (block.start - prev.start) * step,
+      }
+    }
+    blocks.push(block)
+  })
+  const tops = new Array<number>(desiredTops.length)
+  for (const block of blocks) {
+    const top = block.sum / block.count
+    for (let i = 0; i < block.count; i += 1) tops[block.start + i] = top + i * step
+  }
+  return tops
+}
+
+/**
+ * Home position of every entity in the graph — see the layered-DAG contract
+ * above. Detached pools/accounts/proxies (feature 5) are parked in a clearly
+ * separated area below the live graph, x-aligned with their own column;
+ * parked accounts keep the lane-grid treatment.
+ */
+export function layoutPositions(state: GraphState): Record<string, XY> {
+  const out: Record<string, XY> = {}
+  const detachedIds = new Set(detachedEntities(state).map((entity) => entity.id))
+  const colX = layoutColumnX()
+  const stepOf = (kind: EntityKind): number => LAYOUT.nodeHeight[kind] + LAYOUT.rowGap
+  const laneStep = LAYOUT.nodeWidth.account + LAYOUT.laneGap
+
+  /* -- 1. account band: one contiguous block per owning pool ------------- */
+  // The band defines the vertical scale of the whole layout. Attached pools
+  // first (they anchor the pool column), then detached pools — their accounts
+  // are still attached and keep a block while the pool itself parks below.
+  const accountById = new Map(state.accounts.map((account) => [account.id, account]))
+  const placedAccounts = new Set<string>()
+  const blockCentre = new Map<string, number>()
+  let cursor = LAYOUT.topY
+
+  const layBlock = (accounts: AccountEntity[]): number => {
+    const rows = Math.ceil(accounts.length / LAYOUT.accountLanes)
+    accounts.forEach((account, index) => {
+      out[account.id] = {
+        x: colX.account + (index % LAYOUT.accountLanes) * laneStep,
+        y: cursor + Math.floor(index / LAYOUT.accountLanes) * stepOf('account'),
+      }
+      placedAccounts.add(account.id)
+    })
+    const height = rows * LAYOUT.nodeHeight.account + (rows - 1) * LAYOUT.rowGap
+    const centre = cursor + height / 2
+    cursor += height + LAYOUT.blockGap
+    return centre
+  }
+
+  const blockPools = [
+    ...state.pools.filter((pool) => !detachedIds.has(pool.id)),
+    ...state.pools.filter((pool) => detachedIds.has(pool.id)),
+  ]
+  for (const pool of blockPools) {
+    // Member order IS reading order: left-to-right, then down. A duplicated
+    // claim (momentarily inconsistent snapshot) stays with the first pool.
+    const members = pool.members
+      .map((member) => accountById.get(member.accountId))
+      .filter((account): account is AccountEntity => !!account && !placedAccounts.has(account.id))
+    if (members.length === 0) {
+      // Memberless pool: no block — aim the pool just below the previous one.
+      blockCentre.set(pool.id, cursor + LAYOUT.nodeHeight.pool / 2)
+      continue
+    }
+    blockCentre.set(pool.id, layBlock(members))
+  }
+  // Defensive: an attached account no member row names (momentarily
+  // inconsistent snapshot) still needs a home — one trailing block.
+  const strays = state.accounts.filter(
+    (account) => !placedAccounts.has(account.id) && !detachedIds.has(account.id),
+  )
+  if (strays.length > 0) layBlock(strays)
+
+  /* -- 2. pool column: each pool across from its account block ----------- */
+  // Attached pools come first in block order, so their desired tops are
+  // already non-decreasing — exactly what `placeColumn` needs.
+  const attachedPools = state.pools.filter((pool) => !detachedIds.has(pool.id))
+  const poolTops = placeColumn(
+    attachedPools.map(
+      (pool) =>
+        (blockCentre.get(pool.id) ?? LAYOUT.topY + LAYOUT.nodeHeight.pool / 2) -
+        LAYOUT.nodeHeight.pool / 2,
+    ),
+    LAYOUT.nodeHeight.pool,
+    LAYOUT.rowGap,
+  )
+  attachedPools.forEach((pool, index) => {
+    out[pool.id] = { x: colX.pool, y: Math.round(poolTops[index]) }
+  })
+  const poolCentre = new Map(
+    attachedPools.map((pool, index) => [pool.id, poolTops[index] + LAYOUT.nodeHeight.pool / 2]),
+  )
+
+  /* -- 3. key column: barycentre of the bound pools ----------------------- */
+  // A pool named by any binding is attached by definition, so `poolCentre`
+  // covers every reachable target. Keys binding nothing stack below the bound
+  // ones in state order — the same bottom-of-column spot a freshly created
+  // key gets from the server.
+  const keyed = state.keys.map((key) => {
+    const centres = key.bindings
+      .map((binding) => poolCentre.get(binding.poolId))
+      .filter((value): value is number => value !== undefined)
     return {
-      kind,
-      count,
-      rows,
-      width: lanes * LAYOUT.nodeWidth[kind] + (lanes - 1) * LAYOUT.laneGap,
-      height: rows > 0 ? rows * LAYOUT.nodeHeight[kind] + (rows - 1) * LAYOUT.rowGap : 0,
+      key,
+      centre:
+        centres.length > 0 ? centres.reduce((sum, value) => sum + value, 0) / centres.length : null,
     }
   })
+  const boundKeys = keyed.filter((item) => item.centre !== null)
+  // Array.prototype.sort is stable: ties keep state order.
+  boundKeys.sort((a, b) => (a.centre as number) - (b.centre as number))
+  const keyTops = placeColumn(
+    boundKeys.map((item) => (item.centre as number) - LAYOUT.nodeHeight.key / 2),
+    LAYOUT.nodeHeight.key,
+    LAYOUT.rowGap,
+  )
+  boundKeys.forEach((item, index) => {
+    out[item.key.id] = { x: colX.key, y: Math.round(keyTops[index]) }
+  })
+  let nextKeyTop =
+    boundKeys.length > 0 ? keyTops[boundKeys.length - 1] + stepOf('key') : LAYOUT.topY
+  for (const item of keyed) {
+    if (item.centre !== null) continue
+    out[item.key.id] = { x: colX.key, y: Math.round(nextKeyTop) }
+    nextKeyTop += stepOf('key')
+  }
 
-  const tallest = bands.reduce((max, band) => Math.max(max, band.height), 0)
-
-  const slots = {} as Record<EntityKind, XY[]>
-  let x = 0
-  for (const band of bands) {
-    const top = LAYOUT.topY + Math.round((tallest - band.height) / 2)
-    const column: XY[] = []
-    for (let i = 0; i < band.count; i += 1) {
-      const lane = Math.floor(i / band.rows)
-      const row = i % band.rows
-      column.push({
-        x: x + lane * (LAYOUT.nodeWidth[band.kind] + LAYOUT.laneGap),
-        y: top + row * (LAYOUT.nodeHeight[band.kind] + LAYOUT.rowGap),
-      })
+  /* -- 4. gateway: vertically centred on the key column ------------------- */
+  if (state.gateway?.id) {
+    let top = LAYOUT.topY
+    let min = Number.POSITIVE_INFINITY
+    let max = Number.NEGATIVE_INFINITY
+    for (const key of state.keys) {
+      const position = out[key.id]
+      if (!position) continue
+      min = Math.min(min, position.y)
+      max = Math.max(max, position.y + LAYOUT.nodeHeight.key)
     }
-    slots[band.kind] = column
-    x += band.width + LAYOUT.columnGap
+    if (min !== Number.POSITIVE_INFINITY) {
+      top = (min + max) / 2 - LAYOUT.nodeHeight.gateway / 2
+    }
+    out[state.gateway.id] = { x: colX.gateway, y: Math.round(top) }
   }
-  return slots
-}
 
-/** Home slot for the entity that is about to become the `index`-th of its kind. */
-export function layoutSlotFor(counts: KindCounts, kind: EntityKind, index: number): XY {
-  const next: KindCounts = { ...counts, [kind]: Math.max(index + 1, counts[kind] ?? 0) }
-  return layoutSlots(next)[kind][index] ?? { x: 0, y: LAYOUT.topY }
-}
-
-/** Number of entities of every kind currently in the graph. */
-export function kindCounts(state: GraphState): Record<EntityKind, number> {
-  return {
-    gateway: 1,
-    key: state.keys.length,
-    pool: state.pools.length,
-    account: state.accounts.length,
-    proxy: state.proxies.length,
+  /* -- 5. proxy column: barycentre of the accounts dialling it ------------ */
+  // Only accounts already placed in the band pull; an attached proxy whose
+  // only users are parked accounts stacks below the pulled ones.
+  const userCentres = new Map<string, number[]>()
+  for (const account of state.accounts) {
+    if (!account.proxyId) continue
+    const position = out[account.id]
+    if (!position) continue
+    const centre = position.y + LAYOUT.nodeHeight.account / 2
+    const list = userCentres.get(account.proxyId)
+    if (list) list.push(centre)
+    else userCentres.set(account.proxyId, [centre])
   }
+  const proxied = state.proxies
+    .filter((proxy) => !detachedIds.has(proxy.id))
+    .map((proxy) => {
+      const centres = userCentres.get(proxy.id) ?? []
+      return {
+        proxy,
+        centre:
+          centres.length > 0
+            ? centres.reduce((sum, value) => sum + value, 0) / centres.length
+            : null,
+      }
+    })
+  const pulledProxies = proxied.filter((item) => item.centre !== null)
+  pulledProxies.sort((a, b) => (a.centre as number) - (b.centre as number))
+  const proxyTops = placeColumn(
+    pulledProxies.map((item) => (item.centre as number) - LAYOUT.nodeHeight.proxy / 2),
+    LAYOUT.nodeHeight.proxy,
+    LAYOUT.rowGap,
+  )
+  pulledProxies.forEach((item, index) => {
+    out[item.proxy.id] = { x: colX.proxy, y: Math.round(proxyTops[index]) }
+  })
+  let nextProxyTop =
+    pulledProxies.length > 0
+      ? proxyTops[pulledProxies.length - 1] + stepOf('proxy')
+      : LAYOUT.topY
+  for (const item of proxied) {
+    if (item.centre !== null) continue
+    out[item.proxy.id] = { x: colX.proxy, y: Math.round(nextProxyTop) }
+    nextProxyTop += stepOf('proxy')
+  }
+
+  /* -- 6. detached parking (feature 5) ------------------------------------ */
+  let bottom = LAYOUT.topY
+  for (const entity of allEntities(state)) {
+    const position = out[entity.id]
+    if (position) bottom = Math.max(bottom, position.y + LAYOUT.nodeHeight[entity.kind])
+  }
+  const parkY = bottom + LAYOUT.detachedGap
+  state.pools
+    .filter((pool) => detachedIds.has(pool.id))
+    .forEach((pool, index) => {
+      out[pool.id] = { x: colX.pool, y: parkY + index * stepOf('pool') }
+    })
+  state.accounts
+    .filter((account) => detachedIds.has(account.id))
+    .forEach((account, index) => {
+      out[account.id] = {
+        x: colX.account + (index % LAYOUT.accountLanes) * laneStep,
+        y: parkY + Math.floor(index / LAYOUT.accountLanes) * stepOf('account'),
+      }
+    })
+  state.proxies
+    .filter((proxy) => detachedIds.has(proxy.id))
+    .forEach((proxy, index) => {
+      out[proxy.id] = { x: colX.proxy, y: parkY + index * stepOf('proxy') }
+    })
+
+  return out
 }
 
 export function formatNumber(value: number): string {

@@ -33,8 +33,10 @@ import {
   KIND_LABEL_CN,
   KIND_ORDER,
   MIN_READABLE_ZOOM,
+  allEntities,
   canJoinPool,
   edgeId,
+  layoutPositions,
   poolOfAccount,
   type Entity,
   type EntityKind,
@@ -229,6 +231,13 @@ function CanvasInner(): JSX.Element {
    * as stale whenever the account -> pool mapping changes, and nudge them to
    * press 自动布局. The signature only changes on a genuine membership change,
    * not on the ~4x/s health patches, so this effect stays quiet otherwise.
+   *
+   * A signature change alone is not enough, though: the server parks a freshly
+   * created entity exactly at its canonical layout home, so e.g. 新建账号
+   * changes the roster while 自动布局 would be an exact no-op. Showing the
+   * hint then invites a click that changes nothing — so before flagging, the
+   * current positions are compared against `layoutPositions(state)` and the
+   * hint only appears when 自动布局 would actually move at least one card.
    */
   const membershipSig = useMemo(
     () =>
@@ -249,9 +258,14 @@ function CanvasInner(): JSX.Element {
     }
     if (lastMembershipSig.current !== membershipSig) {
       lastMembershipSig.current = membershipSig
-      setLayoutStale(true)
+      const home = layoutPositions(state)
+      const wouldMove = allEntities(state).some((entity) => {
+        const target = home[entity.id]
+        return !!target && (target.x !== entity.position.x || target.y !== entity.position.y)
+      })
+      if (wouldMove) setLayoutStale(true)
     }
-  }, [ready, membershipSig])
+  }, [ready, membershipSig, state])
 
   /** Ids the operator is dragging right now: server patches must not fight them. */
   const draggingIds = useRef<Set<string>>(new Set())

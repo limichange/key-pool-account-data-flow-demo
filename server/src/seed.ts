@@ -28,25 +28,21 @@
  * 「未绑定代理 · 无法加入池」 flow.
  *
  * The `accounts` array below is written in exactly that order — owning pool
- * first (pools in `state.pools` order), unassigned last — because index order
- * IS layout order: `layoutSlots` places the i-th account in the i-th slot of the
- * account band. Since every account has at most one parent the pool->account
- * edges form a forest, and this ordering makes that forest render with almost
- * no edge crossings. Keep the two orders in sync when editing.
+ * first (pools in `state.pools` order), unassigned last — because member order
+ * IS layout order: `layoutPositions` lays each pool's accounts into that
+ * pool's contiguous block in member order. Since every account has at most one
+ * parent the pool->account edges form a forest, and this ordering makes that
+ * forest render with almost no edge crossings. Keep the two orders in sync
+ * when editing.
  */
 import {
-  KIND_ORDER,
-  LAYOUT,
+  allEntities,
   createMetrics,
-  detachedEntities,
-  layoutSlots,
+  layoutPositions,
   type AccountEntity,
-  type Entity,
-  type EntityKind,
   type GatewayEntity,
   type GraphState,
   type KeyEntity,
-  type KindCounts,
   type PoolEntity,
   type ProxyEntity,
 } from '@kpa/shared'
@@ -56,78 +52,17 @@ const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
 /**
- * Vertical clearance between the live graph and the detached parking area.
- * Keep in sync with `DETACHED_GAP` in `web/src/lib/graph.ts` (autoLayout).
- */
-const DETACHED_GAP = 120
-
-/**
- * Drop every entity onto the SAME canonical grid the client's 自动布局
- * produces: attached entities pack the band/lane grid using ATTACHED-ONLY
- * counts, detached ones (feature 5) are parked below the live graph,
- * x-aligned with their own band. Matching `autoLayout` exactly is what makes
- * the first 自动布局 click on an untouched seed a true no-op — packing the
- * detached account into the band here used to shift every band and regroup
- * the account lanes on that first click.
+ * Drop every entity onto the canonical layered-DAG grid via
+ * `layoutPositions` — THE single layout authority, shared with the client's
+ * 自动布局 button and the server's placement of freshly created entities.
+ * Sharing one function is exactly what makes the first 自动布局 click on an
+ * untouched seed a true no-op.
  */
 function placeState(state: GraphState): void {
-  const detachedIds = new Set(detachedEntities(state).map((entity) => entity.id))
-  const attached = <T extends Entity>(list: T[]): T[] =>
-    list.filter((item) => !detachedIds.has(item.id))
-
-  const groups: Record<EntityKind, Entity[]> = {
-    gateway: [state.gateway],
-    // The gateway and keys never detach (see `isDetached`).
-    key: state.keys,
-    pool: attached(state.pools),
-    account: attached(state.accounts),
-    proxy: attached(state.proxies),
-  }
-  const counts: KindCounts = {
-    gateway: groups.gateway.length,
-    key: groups.key.length,
-    pool: groups.pool.length,
-    account: groups.account.length,
-    proxy: groups.proxy.length,
-  }
-  const slots = layoutSlots(counts)
-  for (const kind of KIND_ORDER) {
-    groups[kind].forEach((item, index) => {
-      const slot = slots[kind][index]
-      if (slot) item.position = { x: slot.x, y: slot.y }
-    })
-  }
-
-  /* Detached parking — same rule as `autoLayout` (features 5 + 11). */
-  let bottom = LAYOUT.topY
-  for (const kind of KIND_ORDER) {
-    for (const slot of slots[kind]) bottom = Math.max(bottom, slot.y + LAYOUT.nodeHeight[kind])
-  }
-  // Probe with every count clamped to >= 1: a 0-count band and a 1-count band
-  // share the same width, so `probe[kind][0].x` is the band's base x even when
-  // every node of that band is parked.
-  const probe = layoutSlots({
-    gateway: Math.max(1, counts.gateway ?? 0),
-    key: Math.max(1, counts.key ?? 0),
-    pool: Math.max(1, counts.pool ?? 0),
-    account: Math.max(1, counts.account ?? 0),
-    proxy: Math.max(1, counts.proxy ?? 0),
-  })
-  const parkY = bottom + DETACHED_GAP
-  const detachable = [
-    { kind: 'pool' as const, list: state.pools },
-    { kind: 'account' as const, list: state.accounts },
-    { kind: 'proxy' as const, list: state.proxies },
-  ]
-  for (const { kind, list } of detachable) {
-    const lost = list.filter((entity) => detachedIds.has(entity.id))
-    const baseX = probe[kind][0]?.x ?? 0
-    lost.forEach((entity, index) => {
-      entity.position = {
-        x: baseX,
-        y: parkY + index * (LAYOUT.nodeHeight[kind] + LAYOUT.rowGap),
-      }
-    })
+  const positions = layoutPositions(state)
+  for (const entity of allEntities(state)) {
+    const position = positions[entity.id]
+    if (position) entity.position = position
   }
 }
 
