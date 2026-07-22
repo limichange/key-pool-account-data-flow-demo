@@ -1,0 +1,610 @@
+/* Custom React Flow node cards for Key · Pool · Account · Proxy.
+   Colours, spacing and radii come from theme.css tokens only. */
+
+/* ------------------------------------------------------------------ card -- */
+
+.kpa-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(180deg, var(--bg-panel-2) 0%, var(--bg-panel) 42%, var(--bg-panel) 100%);
+  box-shadow: var(--shadow-sm);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  transition:
+    border-color var(--transition),
+    box-shadow var(--transition),
+    opacity var(--transition),
+    filter var(--transition);
+}
+
+/* accent top border */
+.kpa-node::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 10%;
+  right: 10%;
+  height: 2px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+/* pulse overlay, driven by data-pulse */
+.kpa-node::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border: 1px solid transparent;
+  border-radius: inherit;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.kpa-node:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow);
+}
+
+.kpa-node[data-selected] {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 1px var(--accent-glow),
+    0 0 26px var(--accent-glow),
+    var(--shadow);
+}
+
+.kpa-node[data-traced] {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 1px var(--accent-glow),
+    0 0 34px var(--accent-glow);
+}
+
+.kpa-node[data-dimmed] {
+  opacity: 0.26;
+  filter: saturate(0.35);
+}
+
+.kpa-node[data-pulse='ok']::after {
+  border-color: var(--ok);
+  box-shadow: 0 0 18px var(--ok);
+  animation: kpa-node-flash 450ms ease-out;
+}
+
+.kpa-node[data-pulse='err']::after {
+  border-color: var(--danger);
+  box-shadow: 0 0 18px var(--danger);
+  animation: kpa-node-flash 450ms ease-out;
+}
+
+@keyframes kpa-node-flash {
+  from {
+    opacity: 0.9;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* --------------------------------------------------------------- handles -- */
+
+.kpa-node .kpa-node__handle {
+  width: 8px;
+  height: 18px;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  box-shadow: 0 0 8px var(--accent-glow);
+  transition:
+    width var(--transition),
+    height var(--transition),
+    background var(--transition);
+}
+
+.kpa-node .kpa-node__handle--in {
+  left: -5px;
+}
+
+.kpa-node .kpa-node__handle--out {
+  right: -5px;
+}
+
+.kpa-node .kpa-node__handle:hover,
+.kpa-node .kpa-node__handle.connectionindicator:hover {
+  width: 11px;
+  height: 28px;
+  background: var(--accent);
+}
+
+/* ------------------------------------------------------- level of detail --
+   Below `COMPACT_ZOOM` the dense body renders below ~5px and is pure texture,
+   so the card collapses into a readable topology tile: accent bar, icon, name,
+   status and one headline metric. */
+
+.kpa-node--compact {
+  border-radius: var(--radius);
+}
+
+.kpa-node--compact .kpa-node__header {
+  padding: var(--space-3);
+}
+
+.kpa-node--compact .kpa-node__icon {
+  width: 30px;
+  height: 30px;
+}
+
+.kpa-node--compact .kpa-node__name {
+  font-size: 15px;
+}
+
+.kpa-node--compact .kpa-node__status-text {
+  display: none;
+}
+
+.kpa-node--compact .kpa-node__status .kpa-status-dot {
+  --dot-size: 11px;
+}
+
+.kpa-node__headline {
+  padding: 0 var(--space-3) var(--space-3);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------------- header -- */
+
+.kpa-node__header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-3) var(--space-2);
+}
+
+.kpa-node__icon {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.kpa-node__ident {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.kpa-node__name {
+  overflow: hidden;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-node__subtitle {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-node__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--status-color);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+.kpa-node__status-text {
+  letter-spacing: 0.02em;
+}
+
+/* ---------------------------------------------------------------- badges -- */
+
+.kpa-node__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: 0 var(--space-3) var(--space-2);
+}
+
+/* ----------------------------------------------------- slot 3: detail row -- */
+
+.kpa-node__detail {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3) var(--space-2);
+}
+
+.kpa-node__detail > :first-child {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.kpa-node__detail-aside {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 4px;
+  max-width: 45%;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.kpa-node__detail-aside > svg {
+  flex: none;
+}
+
+.kpa-node__detail-aside-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ------------------------------------------------------------ slot 4: body -- */
+
+.kpa-node__body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0 var(--space-3) var(--space-3);
+}
+
+.kpa-node__mono {
+  font-family: var(--font-mono);
+}
+
+/* masked secret / host row */
+.kpa-node__secret {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 3px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  text-align: left;
+  transition:
+    border-color var(--transition),
+    color var(--transition);
+}
+
+button.kpa-node__secret:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.kpa-node__secret--static {
+  cursor: default;
+}
+
+.kpa-node__secret-text {
+  overflow: hidden;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-node__secret-hint {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-dim);
+}
+
+.kpa-node__secret-hint[data-copied] {
+  color: var(--ok);
+}
+
+/* one-line labelled row */
+.kpa-node__line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.kpa-node__line > svg {
+  flex: none;
+  color: var(--text-dim);
+}
+
+.kpa-node__line-text {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-node__line-aside {
+  margin-left: auto;
+  flex: none;
+  color: var(--text-dim);
+}
+
+.kpa-node__flag {
+  flex: none;
+  font-size: var(--fs-md);
+  line-height: 1;
+}
+
+.kpa-node__spark {
+  display: block;
+  opacity: 0.9;
+}
+
+/* ------------------------------------------------- slot 5: the stat rail --
+   Identical on all four kinds (请求数 / 成功率 / p95) so reliability can be
+   followed from key to proxy without relearning the card. */
+.kpa-node__stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin: 0 var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.kpa-node__stats--2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* A secondary stat strip used inside slot 4 is already inset by the body. */
+.kpa-node__body .kpa-node__stats {
+  margin: 0;
+}
+
+/* gauge + stats pairing (account) */
+.kpa-node__gauge-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.kpa-node__gauge-stats {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: var(--space-1);
+}
+
+/* ---------------------------------------------------------------- footer -- */
+
+.kpa-node__footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.kpa-node__foot-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+
+.kpa-node__foot-item--muted {
+  color: var(--text-dim);
+}
+
+.kpa-node__foot-item > svg {
+  color: var(--text-dim);
+}
+
+.kpa-node__foot-tags {
+  display: inline-flex;
+  overflow: hidden;
+  margin-left: auto;
+  gap: var(--space-1);
+}
+
+.kpa-node__tag {
+  overflow: hidden;
+  max-width: 68px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* -------------------------------------------------------- pool: members -- */
+
+.kpa-members {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.kpa-member {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 52px 20px;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+}
+
+.kpa-member[data-off] {
+  opacity: 0.45;
+}
+
+.kpa-member__name {
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-member__bar {
+  display: block;
+  overflow: hidden;
+  height: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-input);
+  box-shadow: inset 0 0 0 1px var(--border-subtle);
+}
+
+.kpa-member__bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  transition: width var(--transition);
+}
+
+.kpa-member[data-status='cooldown'] .kpa-member__bar-fill,
+.kpa-member[data-status='offline'] .kpa-member__bar-fill,
+.kpa-member[data-status='disabled'] .kpa-member__bar-fill,
+.kpa-member[data-status='exhausted'] .kpa-member__bar-fill {
+  background: var(--status-color);
+  opacity: 0.75;
+}
+
+.kpa-member__weight {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  text-align: right;
+}
+
+.kpa-members__empty {
+  padding: var(--space-2) 0;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  text-align: center;
+}
+
+.kpa-members__more {
+  padding-left: 14px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+/* ----------------------------------------------------- account: cooldown -- */
+
+.kpa-cooldown {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 calc(var(--space-3) * -1);
+  padding: var(--space-1) var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  border-left: 2px solid var(--status-cooldown);
+  background: var(--bg-elevated);
+  color: var(--status-cooldown);
+  font-size: var(--fs-xs);
+}
+
+.kpa-cooldown > svg {
+  animation: kpa-cooldown-blink 900ms ease-in-out infinite alternate;
+}
+
+.kpa-cooldown__text {
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.kpa-cooldown__count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+@keyframes kpa-cooldown-blink {
+  from {
+    opacity: 0.35;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* -------------------------------------------------------- account: proxy -- */
+
+.kpa-proxy-chip {
+  display: inline-flex;
+  overflow: hidden;
+  max-width: 100%;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--proxy-soft);
+  color: var(--proxy);
+  font-size: var(--fs-xs);
+}
+
+.kpa-proxy-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-proxy-chip__flag {
+  flex: none;
+  font-size: var(--fs-md);
+  line-height: 1;
+}
+
+/* --------------------------------------------------------------- motion -- */
+
+@media (prefers-reduced-motion: reduce) {
+  .kpa-node,
+  .kpa-node .kpa-node__handle,
+  .kpa-member__bar-fill,
+  .kpa-node__secret {
+    transition: none;
+  }
+
+  .kpa-node[data-pulse='ok']::after,
+  .kpa-node[data-pulse='err']::after,
+  .kpa-cooldown > svg {
+    animation: none;
+  }
+}

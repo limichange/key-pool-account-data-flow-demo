@@ -1,0 +1,402 @@
+/* ----------------------------------------------------------------- canvas --
+   Deep-space operations canvas: near-black field, subtle dot grid, vignette,
+   and a dark restyle of every React Flow chrome element. */
+
+.kpa-canvas {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 18% -10%, rgba(160, 107, 255, 0.09), transparent 62%),
+    radial-gradient(100% 80% at 92% 106%, rgba(34, 193, 224, 0.08), transparent 60%),
+    var(--bg-canvas);
+}
+
+/* Vignette on the background field only. React Flow's `.react-flow__renderer`
+   computes to z-index 4, so anything above that tints real data — the outer
+   card lanes were being washed out by up to 72% black. Sit at 3 (above
+   `.react-flow__pane`, below the renderer) and stay soft. */
+.kpa-canvas::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+  background: radial-gradient(120% 120% at 50% 50%, transparent 60%, rgba(3, 5, 10, 0.45) 100%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kpa-canvas::after {
+    display: none;
+  }
+}
+
+/* --- empty state ------------------------------------------------------- */
+
+.kpa-canvas__empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 340px;
+  padding: var(--space-5);
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.kpa-canvas__empty svg {
+  color: var(--warn);
+}
+
+.kpa-canvas__empty h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+.kpa-canvas__empty p {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-md);
+  line-height: 1.6;
+}
+
+.kpa-canvas .react-flow {
+  background: transparent;
+}
+
+.kpa-canvas .react-flow__pane {
+  cursor: default;
+}
+
+.kpa-canvas .react-flow__pane.dragging {
+  cursor: grabbing;
+}
+
+.kpa-canvas__grid {
+  opacity: 0.55;
+}
+
+/* --- connection line while dragging ----------------------------------- */
+
+.kpa-canvas .react-flow__connectionline .react-flow__connection-path {
+  stroke: var(--info);
+  stroke-width: 2;
+  stroke-dasharray: 5 4;
+  filter: drop-shadow(0 0 6px rgba(96, 165, 250, 0.55));
+  animation: kpa-connection-dash 600ms linear infinite;
+}
+
+@keyframes kpa-connection-dash {
+  to {
+    stroke-dashoffset: -18;
+  }
+}
+
+.kpa-canvas .react-flow__handle.connectingto {
+  box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.28);
+}
+
+.kpa-canvas .react-flow__handle.valid {
+  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.3);
+}
+
+/* --- controls ---------------------------------------------------------- */
+
+.kpa-canvas .react-flow__controls.kpa-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: var(--space-3);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-panel) 86%, transparent);
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow);
+  z-index: 6;
+}
+
+.kpa-canvas .react-flow__controls-button {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+
+.kpa-canvas .react-flow__controls-button:last-child {
+  border-bottom: none;
+}
+
+.kpa-canvas .react-flow__controls-button:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.kpa-canvas .react-flow__controls-button svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+}
+
+/* --- minimap ----------------------------------------------------------- */
+
+.kpa-canvas .react-flow__minimap.kpa-minimap {
+  margin: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
+  z-index: 6;
+}
+
+.kpa-canvas .react-flow__minimap-mask {
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.kpa-canvas .react-flow__minimap-node {
+  opacity: 0.85;
+}
+
+.kpa-canvas .react-flow__minimap-node.selected {
+  opacity: 1;
+  stroke: var(--text) !important;
+}
+
+/* --- attribution / panels --------------------------------------------- */
+
+.kpa-canvas .react-flow__panel {
+  margin: var(--space-3);
+  z-index: 6;
+}
+
+/* --- legend strip ------------------------------------------------------ */
+
+.kpa-legend.react-flow__panel {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 5px var(--space-3) 5px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bg-panel) 84%, transparent);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  user-select: none;
+}
+
+.kpa-legend__cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.kpa-legend__arrow {
+  width: 14px;
+  height: 1px;
+  margin: 0 2px;
+  background: linear-gradient(90deg, transparent, var(--border-strong), transparent);
+}
+
+.kpa-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+}
+
+.kpa-legend__swatch {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+
+.kpa-legend__label {
+  color: var(--text);
+  font-size: var(--fs-sm);
+  letter-spacing: 0.04em;
+}
+
+.kpa-legend__count {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.kpa-legend__trace {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: var(--space-2);
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--border);
+  color: var(--info);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.kpa-legend__trace code {
+  max-width: 120px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* --- bottom-right tool strip ------------------------------------------ */
+
+.kpa-canvas-tools.react-flow__panel {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-panel) 84%, transparent);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+}
+
+/* --- overlays ---------------------------------------------------------- */
+
+.kpa-canvas__overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6);
+  background: color-mix(in srgb, var(--bg-canvas) 88%, transparent);
+  backdrop-filter: blur(3px);
+}
+
+.kpa-canvas__loading {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-3);
+  width: min(360px, 100%);
+}
+
+.kpa-canvas__shimmer {
+  height: 46px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  background: linear-gradient(
+    100deg,
+    var(--bg-panel) 20%,
+    var(--bg-elevated) 42%,
+    var(--bg-panel) 64%
+  );
+  background-size: 260% 100%;
+  animation: kpa-shimmer 1.3s ease-in-out infinite;
+}
+
+.kpa-canvas__shimmer:nth-child(2) {
+  width: 82%;
+  animation-delay: 120ms;
+}
+
+.kpa-canvas__shimmer:nth-child(3) {
+  width: 64%;
+  animation-delay: 240ms;
+}
+
+@keyframes kpa-shimmer {
+  0% {
+    background-position: 160% 0;
+  }
+  100% {
+    background-position: -60% 0;
+  }
+}
+
+.kpa-canvas__loading-text {
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  letter-spacing: 0.1em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.kpa-canvas__offline {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: 420px;
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.kpa-canvas__offline svg {
+  color: var(--warn);
+}
+
+.kpa-canvas__offline h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+.kpa-canvas__offline p {
+  margin: 0;
+  font-size: var(--fs-md);
+  line-height: 1.7;
+}
+
+.kpa-canvas__offline code {
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--info);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kpa-canvas__shimmer,
+  .kpa-canvas .react-flow__connectionline .react-flow__connection-path {
+    animation: none;
+  }
+}

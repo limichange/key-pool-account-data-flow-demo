@@ -1,0 +1,1053 @@
+/* UI primitive kit — every rule reads its colours/spacing from theme.css tokens.
+   Class prefix: .kpa-  */
+
+/* ------------------------------------------------------------ utilities -- */
+
+.kpa-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.kpa-caption {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.kpa-muted {
+  color: var(--text-muted);
+}
+
+.kpa-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.kpa-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.kpa-truncate {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-scroll {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+/* ------------------------------------------------------------- keyframes -- */
+
+@keyframes kpa-pulse {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.55;
+  }
+  70% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+@keyframes kpa-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.kpa-pulse {
+  animation: kpa-pulse 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* ------------------------------------------------------------- StatusDot -- */
+
+.kpa-status-dot {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--dot-size, 8px);
+  height: var(--dot-size, 8px);
+  flex: none;
+}
+
+.kpa-status-dot__core {
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--status-color, var(--text-dim));
+  box-shadow: 0 0 6px var(--status-color, transparent);
+}
+
+/* Shape channel — see `StatusDot`. A hollow ring reads as "attention" and a
+   ring-around-a-core as "not serving", independent of hue. */
+.kpa-status-dot[data-shape='solid'] .kpa-status-dot__core {
+  box-shadow: none;
+}
+
+.kpa-status-dot[data-shape='ring'] .kpa-status-dot__core {
+  background: transparent;
+  border: max(1.5px, calc(var(--dot-size, 8px) * 0.28)) solid
+    var(--status-color, var(--text-dim));
+  box-shadow: none;
+}
+
+.kpa-status-dot[data-shape='alert'] .kpa-status-dot__core {
+  background: var(--status-color, var(--text-dim));
+  box-shadow:
+    0 0 0 max(1px, calc(var(--dot-size, 8px) * 0.16)) var(--bg-panel),
+    0 0 0 max(2px, calc(var(--dot-size, 8px) * 0.32))
+      color-mix(in srgb, var(--status-color) 70%, transparent);
+}
+
+.kpa-status-dot__halo {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-pill);
+  background: var(--status-color, var(--text-dim));
+  pointer-events: none;
+}
+
+/* ----------------------------------------------------------------- Badge -- */
+
+.kpa-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+}
+
+.kpa-badge--mono .kpa-badge__label {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.kpa-badge__icon {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.kpa-badge__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kpa-badge[data-tone='neutral'] {
+  background: var(--bg-elevated);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.kpa-badge[data-tone='accent'] {
+  background: var(--accent-soft, var(--bg-elevated));
+  border-color: color-mix(in srgb, var(--accent, var(--border-strong)) 35%, transparent);
+  color: var(--accent, var(--text));
+}
+
+.kpa-badge[data-tone='ok'] {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 32%, transparent);
+  color: var(--ok);
+}
+
+.kpa-badge[data-tone='warn'] {
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  border-color: color-mix(in srgb, var(--warn) 32%, transparent);
+  color: var(--warn);
+}
+
+.kpa-badge[data-tone='danger'] {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  color: var(--danger);
+}
+
+.kpa-badge[data-tone='info'] {
+  background: color-mix(in srgb, var(--info) 14%, transparent);
+  border-color: color-mix(in srgb, var(--info) 32%, transparent);
+  color: var(--info);
+}
+
+/* ------------------------------------------------------------- Sparkline -- */
+
+.kpa-sparkline {
+  display: block;
+  overflow: visible;
+  --spark-color: var(--accent, var(--info));
+}
+
+.kpa-sparkline[data-tone='ok'] {
+  --spark-color: var(--ok);
+}
+.kpa-sparkline[data-tone='warn'] {
+  --spark-color: var(--warn);
+}
+.kpa-sparkline[data-tone='danger'] {
+  --spark-color: var(--danger);
+}
+
+.kpa-sparkline__line {
+  fill: none;
+  stroke: var(--spark-color);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.kpa-sparkline__area {
+  stroke: none;
+}
+
+.kpa-sparkline__stop-a {
+  stop-color: var(--spark-color);
+  stop-opacity: 0.32;
+}
+
+.kpa-sparkline__stop-b {
+  stop-color: var(--spark-color);
+  stop-opacity: 0;
+}
+
+.kpa-sparkline__baseline {
+  stroke: var(--border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.kpa-sparkline__dot {
+  fill: var(--spark-color);
+  vector-effect: non-scaling-stroke;
+}
+
+/* ------------------------------------------------------------- MetricBar -- */
+
+.kpa-metricbar {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  --bar-color: var(--accent, var(--info));
+}
+
+.kpa-metricbar[data-tone='ok'] {
+  --bar-color: var(--ok);
+}
+.kpa-metricbar[data-tone='warn'] {
+  --bar-color: var(--warn);
+}
+.kpa-metricbar[data-tone='danger'] {
+  --bar-color: var(--danger);
+}
+
+.kpa-metricbar__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.kpa-metricbar__right {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  flex: none;
+  color: var(--text);
+}
+
+.kpa-metricbar__pct {
+  color: var(--text-dim);
+}
+
+.kpa-metricbar__track {
+  position: relative;
+  width: 100%;
+  height: var(--bar-height, 4px);
+  border-radius: var(--radius-pill);
+  background: var(--bg-input);
+  box-shadow: inset 0 0 0 1px var(--border-subtle);
+  overflow: hidden;
+}
+
+.kpa-metricbar__fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--bar-color) 55%, transparent),
+    var(--bar-color)
+  );
+  box-shadow: 0 0 8px color-mix(in srgb, var(--bar-color) 45%, transparent);
+  transition: width var(--transition);
+}
+
+/* ------------------------------------------------------------------ Stat -- */
+
+.kpa-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  --stat-color: var(--text);
+}
+
+.kpa-stat[data-tone='ok'] {
+  --stat-color: var(--ok);
+}
+.kpa-stat[data-tone='warn'] {
+  --stat-color: var(--warn);
+}
+.kpa-stat[data-tone='danger'] {
+  --stat-color: var(--danger);
+}
+
+.kpa-stat[data-align='right'] {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.kpa-stat__value {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--stat-color);
+}
+
+.kpa-stat__unit {
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+/* --------------------------------------------------------------- Section -- */
+
+.kpa-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
+
+.kpa-section--dense {
+  padding: var(--space-2);
+  gap: 6px;
+}
+
+.kpa-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: 16px;
+}
+
+.kpa-section__title {
+  min-width: 0;
+}
+
+.kpa-section__toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+}
+
+.kpa-section__toggle:hover .kpa-caption {
+  color: var(--text-muted);
+}
+
+.kpa-section__chevron {
+  flex: none;
+  color: var(--text-dim);
+  transition: transform var(--transition);
+}
+
+.kpa-section[data-open='false'] .kpa-section__chevron {
+  transform: rotate(-90deg);
+}
+
+.kpa-section__action {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+
+.kpa-section__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  animation: kpa-fade-in var(--transition);
+}
+
+/* ---------------------------------------------------------------- Button -- */
+
+.kpa-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    transform var(--transition),
+    box-shadow var(--transition),
+    color var(--transition);
+}
+
+.kpa-btn--full {
+  width: 100%;
+}
+
+.kpa-btn[data-size='sm'] {
+  height: 26px;
+  padding: 0 9px;
+  font-size: var(--fs-sm);
+}
+
+.kpa-btn[data-size='md'] {
+  height: 32px;
+  padding: 0 13px;
+  font-size: var(--fs-md);
+}
+
+.kpa-btn__icon {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.kpa-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.kpa-btn:active:not(:disabled) {
+  transform: none;
+}
+
+.kpa-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-root), 0 0 0 3px var(--accent, var(--info));
+}
+
+.kpa-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.kpa-btn[data-variant='primary'] {
+  background: var(--accent, var(--info));
+  border-color: transparent;
+  color: var(--text-inverse);
+  font-weight: 600;
+}
+
+.kpa-btn[data-variant='primary']:hover:not(:disabled) {
+  background: var(--accent, var(--info));
+  box-shadow: 0 4px 14px var(--accent-glow, rgba(96, 165, 250, 0.4));
+}
+
+.kpa-btn[data-variant='ghost'] {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+
+.kpa-btn[data-variant='ghost']:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.kpa-btn[data-variant='danger'] {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 34%, transparent);
+  color: var(--danger);
+}
+
+.kpa-btn[data-variant='danger']:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+}
+
+/* ------------------------------------------------------------ IconButton -- */
+
+.kpa-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  transition:
+    background var(--transition),
+    color var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+
+.kpa-iconbtn[data-size='sm'] {
+  width: 26px;
+  height: 26px;
+}
+
+.kpa-iconbtn[data-size='md'] {
+  width: 32px;
+  height: 32px;
+}
+
+.kpa-iconbtn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.kpa-iconbtn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-root), 0 0 0 3px var(--accent, var(--info));
+}
+
+.kpa-iconbtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.kpa-iconbtn[data-active='true'] {
+  background: var(--accent-soft, color-mix(in srgb, var(--info) 16%, transparent));
+  border-color: color-mix(in srgb, var(--accent, var(--info)) 38%, transparent);
+  color: var(--accent, var(--info));
+}
+
+.kpa-iconbtn[data-tone='accent'] {
+  color: var(--accent, var(--info));
+}
+
+.kpa-iconbtn[data-tone='danger'] {
+  color: var(--danger);
+}
+
+.kpa-iconbtn[data-tone='danger']:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+}
+
+/* ---------------------------------------------------------------- Fields -- */
+
+.kpa-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.kpa-field__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.kpa-field__label {
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kpa-field__right {
+  flex: none;
+  font-size: var(--fs-xs);
+  color: var(--text);
+}
+
+.kpa-field__hint {
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+  color: var(--text-dim);
+}
+
+.kpa-field--inline .kpa-field__head {
+  flex: 1;
+}
+
+.kpa-input {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  transition:
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+
+input.kpa-input:focus,
+.kpa-input:focus-within {
+  outline: none;
+  border-color: var(--accent, var(--info));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, var(--info)) 16%, transparent);
+}
+
+.kpa-input::placeholder {
+  color: var(--text-dim);
+}
+
+.kpa-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.kpa-input--group {
+  gap: 6px;
+  padding-right: 8px;
+}
+
+.kpa-input__inner {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: var(--fs-sm);
+}
+
+.kpa-input__inner:focus {
+  outline: none;
+}
+
+.kpa-input__suffix {
+  flex: none;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+
+/* hide the native number spinners — the field is already clamped */
+.kpa-input__inner[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.kpa-input__inner[type='number']::-webkit-outer-spin-button,
+.kpa-input__inner[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* select */
+
+.kpa-select {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
+.kpa-select__control {
+  width: 100%;
+  height: 28px;
+  padding: 0 26px 0 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  appearance: none;
+  transition:
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+
+.kpa-select__control:focus {
+  outline: none;
+  border-color: var(--accent, var(--info));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, var(--info)) 16%, transparent);
+}
+
+.kpa-select__control option {
+  background: var(--bg-panel-2);
+  color: var(--text);
+}
+
+.kpa-select__chevron {
+  position: absolute;
+  right: 8px;
+  pointer-events: none;
+  color: var(--text-dim);
+}
+
+/* toggle */
+
+.kpa-switch {
+  position: relative;
+  flex: none;
+  width: 30px;
+  height: 17px;
+  padding: 0;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+
+.kpa-switch__knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: var(--radius-pill);
+  background: var(--text-dim);
+  transition:
+    transform var(--transition),
+    background var(--transition);
+}
+
+.kpa-switch[aria-checked='true'] {
+  background: var(--accent-soft, color-mix(in srgb, var(--info) 18%, transparent));
+  border-color: var(--accent, var(--info));
+}
+
+.kpa-switch[aria-checked='true'] .kpa-switch__knob {
+  transform: translateX(13px);
+  background: var(--accent, var(--info));
+}
+
+.kpa-switch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-root), 0 0 0 3px var(--accent, var(--info));
+}
+
+/* slider */
+
+.kpa-slider {
+  --slider-ratio: 0%;
+  width: 100%;
+  height: 14px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  appearance: none;
+  cursor: pointer;
+}
+
+.kpa-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    90deg,
+    var(--accent, var(--info)) 0 var(--slider-ratio),
+    var(--bg-input) var(--slider-ratio) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.kpa-slider::-moz-range-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-input);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.kpa-slider::-moz-range-progress {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--accent, var(--info));
+}
+
+.kpa-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  margin-top: -3.5px;
+  border-radius: var(--radius-pill);
+  border: 2px solid var(--bg-root);
+  background: var(--accent, var(--info));
+  box-shadow: 0 0 8px var(--accent-glow, rgba(96, 165, 250, 0.45));
+  transition: transform var(--transition);
+}
+
+.kpa-slider::-moz-range-thumb {
+  width: 11px;
+  height: 11px;
+  border-radius: var(--radius-pill);
+  border: 2px solid var(--bg-root);
+  background: var(--accent, var(--info));
+}
+
+.kpa-slider:hover::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+
+.kpa-slider:focus-visible {
+  outline: none;
+}
+
+.kpa-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, var(--info)) 30%, transparent);
+}
+
+/* --------------------------------------------------------------- TagList -- */
+
+.kpa-taglist {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.kpa-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    border-color var(--transition),
+    color var(--transition);
+}
+
+.kpa-tag:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.kpa-tag--more {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.kpa-tag__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kpa-tag__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  margin-right: -3px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-dim);
+  opacity: 0;
+  transition:
+    opacity var(--transition),
+    color var(--transition);
+}
+
+.kpa-tag:hover .kpa-tag__remove,
+.kpa-tag__remove:focus-visible {
+  opacity: 1;
+}
+
+.kpa-tag__remove:hover {
+  color: var(--danger);
+}
+
+.kpa-tag--add {
+  padding: 0 5px;
+  color: var(--text-dim);
+  border-style: dashed;
+}
+
+.kpa-tag--add:hover {
+  color: var(--accent, var(--info));
+  border-color: var(--accent, var(--border-strong));
+}
+
+.kpa-tag__input {
+  width: 84px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent, var(--border-strong));
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: var(--fs-xs);
+}
+
+.kpa-tag__input:focus {
+  outline: none;
+}
+
+/* ----------------------------------------------------------------- Empty -- */
+
+.kpa-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: var(--space-5) var(--space-3);
+  text-align: center;
+}
+
+.kpa-empty__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-pill);
+  border: 1px dashed var(--border-strong);
+  color: var(--text-dim);
+}
+
+.kpa-empty__title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.kpa-empty__hint {
+  max-width: 24ch;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+/* ----------------------------------------------------------------- Gauge -- */
+
+.kpa-gauge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  --gauge-color: var(--accent, var(--info));
+}
+
+.kpa-gauge[data-tone='ok'] {
+  --gauge-color: var(--ok);
+}
+.kpa-gauge[data-tone='warn'] {
+  --gauge-color: var(--warn);
+}
+.kpa-gauge[data-tone='danger'] {
+  --gauge-color: var(--danger);
+}
+
+.kpa-gauge__track {
+  fill: none;
+  stroke: var(--bg-input);
+  stroke-linecap: round;
+}
+
+.kpa-gauge__value {
+  fill: none;
+  stroke: var(--gauge-color);
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--gauge-color) 55%, transparent));
+  transition: stroke-dashoffset var(--transition);
+}
+
+.kpa-gauge__center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  pointer-events: none;
+}
+
+.kpa-gauge__pct {
+  /* Sized so a formatted read-out ("1.24s") still fits a 58px gauge. */
+  font-size: var(--fs-md);
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.kpa-gauge__label {
+  max-width: 90%;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}

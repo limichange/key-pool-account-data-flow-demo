@@ -1,0 +1,20 @@
+{
+  "name": "key-pool-account-data-flow-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@11.5.3",
+  "scripts": {
+    "dev": "concurrently -n server,web -c magenta,cyan \"pnpm -C server dev\" \"pnpm -C web dev\"",
+    "dev:server": "pnpm -C server dev",
+    "dev:web": "pnpm -C web dev",
+    "build": "pnpm -C web build",
+    "preview": "pnpm -C web preview",
+    "typecheck": "tsc -p shared/tsconfig.json --noEmit && tsc -p server/tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "playwright": "^1.61.1",
+    "typescript": "^5.7.3"
+  }
+}

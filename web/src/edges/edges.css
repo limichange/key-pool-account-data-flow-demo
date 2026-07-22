@@ -1,0 +1,203 @@
+/* ------------------------------------------------------------------ edges --
+   Traffic-carrying bezier edges. Colour comes from the source entity kind via
+   the [data-kind] helper defined in theme.css, so nothing here is hardcoded. */
+
+.kpa-edge {
+  --edge-color: var(--accent, var(--border-strong));
+  transition: opacity var(--transition);
+}
+
+.kpa-edge path.kpa-edge__path {
+  stroke: var(--edge-color);
+  fill: none;
+  stroke-linecap: round;
+  opacity: 0.62;
+  transition:
+    opacity var(--transition),
+    stroke var(--transition);
+}
+
+/* Beat React Flow's own `.react-flow__edge.selected .react-flow__edge-path` rule. */
+.react-flow__edge:hover .kpa-edge path.kpa-edge__path,
+.react-flow__edge.selected .kpa-edge path.kpa-edge__path,
+.react-flow__edge:focus .kpa-edge path.kpa-edge__path,
+.react-flow__edge:focus-visible .kpa-edge path.kpa-edge__path {
+  stroke: var(--edge-color);
+  opacity: 1;
+}
+
+.react-flow__edge.selected .kpa-edge[data-disabled='true'] path.kpa-edge__path {
+  stroke: var(--text-dim);
+}
+
+/* --- traced ---------------------------------------------------------- */
+
+.kpa-edge[data-traced='true'] path.kpa-edge__path {
+  opacity: 1;
+}
+
+.kpa-edge__halo {
+  stroke: var(--edge-color);
+  stroke-linecap: round;
+  opacity: 0.22;
+  filter: blur(2px);
+  animation: kpa-edge-halo 1.6s ease-in-out infinite;
+}
+
+@keyframes kpa-edge-halo {
+  0%,
+  100% {
+    opacity: 0.16;
+  }
+  50% {
+    opacity: 0.34;
+  }
+}
+
+/* --- disabled / dimmed ----------------------------------------------- */
+
+.kpa-edge[data-disabled='true'] path.kpa-edge__path {
+  stroke: var(--text-dim);
+  stroke-dasharray: 6 6;
+  opacity: 0.4;
+}
+
+.kpa-edge[data-dimmed='true'] {
+  opacity: 0.12;
+  pointer-events: none;
+}
+
+.kpa-edge[data-dimmed='true'] .kpa-edge__particle,
+.kpa-edge[data-dimmed='true'] .kpa-edge__flash {
+  display: none;
+}
+
+/* --- selection ------------------------------------------------------- */
+
+.kpa-edge--selected path.kpa-edge__path {
+  stroke-dasharray: none;
+  filter: drop-shadow(0 0 6px var(--accent-glow, transparent));
+}
+
+/* --- traffic particles ------------------------------------------------ */
+
+.kpa-edge__particle {
+  --particle-color: var(--ok);
+  pointer-events: none;
+}
+
+.kpa-edge__particle[data-ok='false'] {
+  --particle-color: var(--danger);
+}
+
+.kpa-edge__particle-core {
+  fill: var(--particle-color);
+  animation: kpa-particle-fade 900ms linear forwards;
+}
+
+.kpa-edge__particle-halo {
+  fill: var(--particle-color);
+  opacity: 0.22;
+  animation: kpa-particle-halo 900ms linear forwards;
+}
+
+@keyframes kpa-particle-fade {
+  0% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  12% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+
+@keyframes kpa-particle-halo {
+  0% {
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.3;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* --- reduced motion fallback ----------------------------------------- */
+
+.kpa-edge__flash {
+  stroke: var(--ok);
+  stroke-linecap: round;
+  animation: kpa-edge-flash 280ms ease-out forwards;
+}
+
+.kpa-edge__flash[data-ok='false'] {
+  stroke: var(--danger);
+}
+
+@keyframes kpa-edge-flash {
+  0% {
+    opacity: 0;
+  }
+  30% {
+    opacity: 0.75;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kpa-edge__halo {
+    animation: none;
+    opacity: 0.26;
+  }
+}
+
+/* --- midpoint label pill ---------------------------------------------- */
+
+.kpa-edge-label {
+  position: absolute;
+  pointer-events: all;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 168px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: var(--shadow-sm);
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background var(--transition);
+}
+
+.kpa-edge-label:hover,
+.kpa-edge-label[data-traced='true'] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--bg-panel) 80%, var(--accent-soft));
+}
+
+.kpa-edge-label[data-disabled='true'] {
+  color: var(--text-dim);
+  border-style: dashed;
+}

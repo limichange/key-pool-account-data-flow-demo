@@ -1,0 +1,194 @@
+/* Design tokens for the Key · Pool · Account · Proxy console.
+   Every component styles itself from these variables — do not hardcode colours. */
+
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --bg-root: #070a11;
+  --bg-canvas: #0a0e17;
+  --bg-panel: #0f1421;
+  --bg-panel-2: #141b2b;
+  --bg-elevated: #1a2233;
+  --bg-hover: #1f293c;
+  --bg-input: #0c111c;
+
+  /* lines */
+  --border: #1e2739;
+  --border-strong: #2c3852;
+  --border-subtle: #161d2b;
+
+  /* text — --text-dim is used at 10-11px on --bg-panel, so it must clear
+     4.5:1; --text-faint is the old value, kept for purely decorative marks. */
+  --text: #e6ecf7;
+  --text-muted: #8c9bb5;
+  --text-dim: #7b8aa6;
+  --text-faint: #5d6b85;
+  --text-inverse: #070a11;
+
+  /* entity accents */
+  --key: #f5a524;
+  --key-soft: rgba(245, 165, 36, 0.14);
+  --key-glow: rgba(245, 165, 36, 0.45);
+
+  --pool: #a06bff;
+  --pool-soft: rgba(160, 107, 255, 0.14);
+  --pool-glow: rgba(160, 107, 255, 0.45);
+
+  --account: #22c1e0;
+  --account-soft: rgba(34, 193, 224, 0.14);
+  --account-glow: rgba(34, 193, 224, 0.45);
+
+  --proxy: #2ee6a8;
+  --proxy-soft: rgba(46, 230, 168, 0.14);
+  --proxy-glow: rgba(46, 230, 168, 0.45);
+
+  /* status — deliberately disjoint from the four entity hues above, so a
+     colour on a card always answers exactly one question. Healthy is a quiet
+     neutral (nothing to report); every alert state owns a hue no kind uses.
+     `StatusDot` adds a shape channel on top for colour-blind viewers. */
+  --status-healthy: #9fb2c9;
+  --status-degraded: #ff8a3d;
+  --status-throttled: #ff5f56;
+  --status-exhausted: #e6395f;
+  --status-cooldown: #4dd0ff;
+  --status-disabled: #55637a;
+  --status-offline: #8593a8;
+
+  /* semantic */
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --info: #60a5fa;
+
+  /* geometry */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* type */
+  --font-sans:
+    'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, 'Menlo', 'Consolas', monospace;
+
+  /* No live data may render below 11px. */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 12px;
+  --fs-lg: 14px;
+  --fs-xl: 18px;
+
+  /* effects */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.55);
+  --ring: 0 0 0 1px var(--border-strong);
+
+  --transition: 160ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Per-kind accent helper: put `data-kind="key|pool|account|proxy"` on a wrapper
+   and read --accent / --accent-soft / --accent-glow inside it. */
+[data-kind='key'] {
+  --accent: var(--key);
+  --accent-soft: var(--key-soft);
+  --accent-glow: var(--key-glow);
+}
+[data-kind='pool'] {
+  --accent: var(--pool);
+  --accent-soft: var(--pool-soft);
+  --accent-glow: var(--pool-glow);
+}
+[data-kind='account'] {
+  --accent: var(--account);
+  --accent-soft: var(--account-soft);
+  --accent-glow: var(--account-glow);
+}
+[data-kind='proxy'] {
+  --accent: var(--proxy);
+  --accent-soft: var(--proxy-soft);
+  --accent-glow: var(--proxy-glow);
+}
+
+/* Status colour helper: `data-status="healthy|degraded|..."` exposes --status-color. */
+[data-status='healthy'] {
+  --status-color: var(--status-healthy);
+}
+[data-status='degraded'] {
+  --status-color: var(--status-degraded);
+}
+[data-status='throttled'] {
+  --status-color: var(--status-throttled);
+}
+[data-status='exhausted'] {
+  --status-color: var(--status-exhausted);
+}
+[data-status='cooldown'] {
+  --status-color: var(--status-cooldown);
+}
+[data-status='disabled'] {
+  --status-color: var(--status-disabled);
+}
+[data-status='offline'] {
+  --status-color: var(--status-offline);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-root);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-pill);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
