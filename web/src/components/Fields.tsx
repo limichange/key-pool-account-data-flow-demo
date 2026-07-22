@@ -188,11 +188,29 @@ export function NumberField({
 
 /* --------------------------------------------------------- SelectField -- */
 
+export interface SelectOption<T extends string> {
+  value: T
+  label: string
+  disabled?: boolean
+}
+
+/** A native `<optgroup>`: used when the choices carry two different meanings. */
+export interface SelectGroup<T extends string> {
+  label: string
+  options: SelectOption<T>[]
+}
+
 export interface SelectFieldProps<T extends string> {
   label: string
   value: T
   onChange(v: T): void
-  options: { value: T; label: string }[]
+  /** Ungrouped choices, rendered before every group (placeholders live here). */
+  options?: SelectOption<T>[]
+  /**
+   * Grouped choices. Empty groups are skipped, so a caller can hand over a
+   * fixed set of buckets and let the data decide which ones actually appear.
+   */
+  groups?: SelectGroup<T>[]
   hint?: string
   className?: string
 }
@@ -202,10 +220,13 @@ export function SelectField<T extends string>({
   value,
   onChange,
   options,
+  groups,
   hint,
   className,
 }: SelectFieldProps<T>) {
   const id = useId()
+  const flat = options ?? []
+  const grouped = (groups ?? []).filter((group) => group.options.length > 0)
   return (
     <FieldShell label={label} hint={hint} htmlFor={id} className={className}>
       <div className="kpa-select">
@@ -215,10 +236,19 @@ export function SelectField<T extends string>({
           value={value}
           onChange={(e) => onChange(e.target.value as T)}
         >
-          {options.map((option) => (
-            <option key={option.value} value={option.value}>
+          {flat.map((option) => (
+            <option key={option.value} value={option.value} disabled={option.disabled}>
               {option.label}
             </option>
+          ))}
+          {grouped.map((group) => (
+            <optgroup key={group.label} label={group.label}>
+              {group.options.map((option) => (
+                <option key={option.value} value={option.value} disabled={option.disabled}>
+                  {option.label}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </select>
         <ChevronDown size={12} className="kpa-select__chevron" />

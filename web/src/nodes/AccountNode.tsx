@@ -1,12 +1,13 @@
 import { memo, useEffect, useState } from 'react'
 import type { NodeProps } from '@xyflow/react'
-import { Flame, Globe2, MapPin, Unplug } from 'lucide-react'
+import { Flame, Globe2, Layers, MapPin, Unplug } from 'lucide-react'
 import {
   LATENCY_SCALE_MS,
   formatMs,
   formatNumber,
   type AccountEntity,
   type CredentialType,
+  type PoolEntity,
   type ProxyEntity,
 } from '@kpa/shared'
 
@@ -38,6 +39,9 @@ export const AccountNode = memo(function AccountNode({
   const metrics = entity.metrics
   const health = entity.health
   const proxy = useEntity(entity.proxyId)
+  // Derived back-reference maintained by the server: an account belongs to at
+  // most one pool, `null` means 未分配 and the account receives no traffic.
+  const pool = useEntity(entity.poolId)
 
   const cooldownUntil = health.cooldownUntil ?? 0
   const cooling = entity.status === 'cooldown' || cooldownUntil > Date.now()
@@ -53,11 +57,16 @@ export const AccountNode = memo(function AccountNode({
   const ProviderIcon = providerIcon(entity.provider)
 
   const typedProxy = proxy && proxy.kind === 'proxy' ? (proxy as ProxyEntity) : undefined
+  const typedPool = pool && pool.kind === 'pool' ? (pool as PoolEntity) : undefined
 
   const quotaLimit = entity.quota.limitTokens
   const rpmMax = entity.rateLimit.rpm > 0 ? entity.rateLimit.rpm : Math.max(60, metrics.rpm)
   // Same vocabulary as every other card: a success rate, not its inverse.
   const rate = 1 - health.errorRate
+
+  const poolName = typedPool?.name ?? '未分配'
+  // The compact card drops the footer, so the owning pool rides in the headline.
+  const headline = `${formatMs(health.latencyMs)} · ${Math.round(rate * 100)}% · ${poolName}`
 
   return (
     <NodeShell
@@ -68,7 +77,7 @@ export const AccountNode = memo(function AccountNode({
       handles="in-out"
       icon={<ProviderIcon size={14} />}
       subtitle={<span className="kpa-node__mono">{entity.id}</span>}
-      headline={`${formatMs(health.latencyMs)} · ${Math.round(rate * 100)}%`}
+      headline={headline}
       badges={
         <>
           <Badge tone="accent">{providerLabel(entity.provider)}</Badge>
@@ -105,17 +114,33 @@ export const AccountNode = memo(function AccountNode({
         </>
       }
       footer={
-        typedProxy ? (
-          <span className="kpa-proxy-chip" title={`${typedProxy.host}:${typedProxy.port}`}>
-            <Globe2 size={10} />
-            <span className="kpa-proxy-chip__name">{typedProxy.name}</span>
-            <span className="kpa-proxy-chip__flag">{countryFlag(typedProxy.countryCode)}</span>
-          </span>
-        ) : (
-          <span className="kpa-node__foot-item kpa-node__foot-item--muted">
-            <Unplug size={10} /> 直连
-          </span>
-        )
+        <>
+          {typedPool ? (
+            <span className="kpa-pool-chip" title={`所属池：${typedPool.name}`}>
+              <Layers size={10} />
+              <span className="kpa-pool-chip__name">{typedPool.name}</span>
+            </span>
+          ) : (
+            <span
+              className="kpa-pool-chip kpa-pool-chip--none"
+              title="未分配到任何池，不会收到流量"
+            >
+              <Layers size={10} />
+              <span className="kpa-pool-chip__name">未分配</span>
+            </span>
+          )}
+          {typedProxy ? (
+            <span className="kpa-proxy-chip" title={`${typedProxy.host}:${typedProxy.port}`}>
+              <Globe2 size={10} />
+              <span className="kpa-proxy-chip__name">{typedProxy.name}</span>
+              <span className="kpa-proxy-chip__flag">{countryFlag(typedProxy.countryCode)}</span>
+            </span>
+          ) : (
+            <span className="kpa-node__foot-item kpa-node__foot-item--muted">
+              <Unplug size={10} /> 直连
+            </span>
+          )}
+        </>
       }
     >
       {cooling ? (

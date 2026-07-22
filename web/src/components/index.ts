@@ -27,6 +27,8 @@ export type {
   TextFieldProps,
   NumberFieldProps,
   SelectFieldProps,
+  SelectOption,
+  SelectGroup,
   ToggleFieldProps,
   SliderFieldProps,
 } from './Fields'

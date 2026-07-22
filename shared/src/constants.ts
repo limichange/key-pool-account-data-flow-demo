@@ -86,9 +86,9 @@ export const MODELS = [
  * Cards are information dense and therefore tall; `nodeHeight` is the slot
  * height reserved for one card (a little larger than the tallest rendering of
  * that kind so a card that grows a banner still never overlaps its neighbour).
- * A kind whose column would grow past `maxRowsPerLane` wraps into extra lanes
- * inside its own band, which keeps the whole graph close to the aspect ratio of
- * the canvas instead of degenerating into one very tall strip.
+ * A kind whose column would grow past `maxRowsPerLane[kind]` wraps into extra
+ * lanes inside its own band, which keeps the whole graph close to the aspect
+ * ratio of the canvas instead of degenerating into one very tall strip.
  */
 export const LAYOUT = {
   /** Horizontal gutter between two kind bands. */
@@ -97,8 +97,17 @@ export const LAYOUT = {
   laneGap: 28,
   /** Vertical gap between two cards in the same lane. */
   rowGap: 44,
-  /** Cards stacked in one lane before the band wraps into another lane. */
-  maxRowsPerLane: 4,
+  /**
+   * Cards stacked in one lane before the band wraps into another lane, PER KIND.
+   *
+   * Accounts outnumber every other kind roughly two to one (the seed ships 16 of
+   * them against 7/6/7), so they get the tallest lane: one deep account band and
+   * three shallow neighbours keep the seed graph at ~3884x2620 px, i.e. an
+   * aspect ratio of ~1.48 — comfortably inside the 1.3..1.9 window the canvas
+   * viewport wants. Giving accounts the same shallow lane as the rest would
+   * spread them over four lanes and blow the ratio past 2.0.
+   */
+  maxRowsPerLane: { key: 3, pool: 3, account: 6, proxy: 3 } as Record<EntityKind, number>,
   topY: 0,
   nodeWidth: { key: 300, pool: 320, account: 320, proxy: 300 } as Record<EntityKind, number>,
   /**

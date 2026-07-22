@@ -7,6 +7,7 @@ import {
   STATUS_LABEL_CN,
   allEntities,
   isServing,
+  unassignedAccounts,
 } from '@kpa/shared'
 import type { EntityKind } from '@kpa/shared'
 
@@ -27,6 +28,17 @@ const CREATE_LABEL: Record<EntityKind, string> = {
   account: '新建账号',
   proxy: '新建代理',
 }
+
+/**
+ * The four relations and their exact cardinality. This is the clearest place in
+ * the console to teach the model, so it is spelled out rather than implied.
+ */
+const CARDINALITY_RULES: [string, string][] = [
+  ['密钥 ⇄ 池', '多对多：一个密钥可绑定多个池，一个池也能被多个密钥绑定'],
+  ['池 → 账号', '一对多：一个池持有多个账号，但一个账号只能属于一个池'],
+  ['账号 → 代理', '多对一：一个账号最多一个代理，一个代理可服务多个账号'],
+  ['未分配账号', '合法状态：不属于任何池，在加入池之前不会收到任何流量'],
+]
 
 const SHORTCUTS: [string, string][] = [
   ['Space', '暂停 / 继续模拟器'],
@@ -63,6 +75,12 @@ export function Palette(): JSX.Element {
     }
     return acc
   }, [state])
+
+  /**
+   * Accounts owned by no pool. Zero is legal, but such an account is a dead
+   * end — it receives no traffic — so it must never be invisible.
+   */
+  const orphans = useMemo(() => unassignedAccounts(state).length, [state])
 
   /** How many entities the current free-text search actually matches. */
   const matchCount = useMemo(() => {
@@ -114,6 +132,21 @@ export function Palette(): JSX.Element {
               </div>
             )
           })}
+          <div
+            className="kpa-pal-orphans"
+            data-warn={orphans > 0 ? 'true' : undefined}
+            title={
+              orphans > 0
+                ? '这些账号不属于任何池，不会收到任何流量'
+                : '每个账号都已归属到某个池'
+            }
+          >
+            <span className="kpa-pal-orphans-label">
+              {orphans > 0 ? <AlertTriangle size={11} /> : null}
+              未分配账号
+            </span>
+            <span className="kpa-pal-orphans-count">{orphans}</span>
+          </div>
         </div>
       </Section>
 
@@ -201,6 +234,15 @@ export function Palette(): JSX.Element {
             </li>
           ))}
         </ol>
+        <div className="kpa-pal-caption">关系基数</div>
+        <dl className="kpa-pal-rules">
+          {CARDINALITY_RULES.map(([relation, rule]) => (
+            <div className="kpa-pal-rule-row" key={relation}>
+              <dt>{relation}</dt>
+              <dd>{rule}</dd>
+            </div>
+          ))}
+        </dl>
         <div className="kpa-pal-caption">快捷键</div>
         <dl className="kpa-pal-keys">
           {SHORTCUTS.map(([key, description]) => (

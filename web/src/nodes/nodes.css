@@ -565,8 +565,17 @@ button.kpa-node__secret:hover {
   }
 }
 
-/* -------------------------------------------------------- account: proxy -- */
+/* ------------------------------------------------- account: pool + proxy -- */
 
+/* Two chips share the account footer: the owning pool (violet) and the egress
+   proxy (green). Both may shrink so the row keeps its single-line height and
+   the card never grows past its layout slot. */
+.kpa-node[data-kind='account'] .kpa-node__footer > * {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.kpa-pool-chip,
 .kpa-proxy-chip {
   display: inline-flex;
   overflow: hidden;
@@ -575,11 +584,31 @@ button.kpa-node__secret:hover {
   gap: var(--space-1);
   padding: 1px var(--space-2);
   border-radius: var(--radius-pill);
-  background: var(--proxy-soft);
-  color: var(--proxy);
   font-size: var(--fs-xs);
 }
 
+.kpa-pool-chip {
+  background: var(--pool-soft);
+  color: var(--pool);
+}
+
+/* An account with no pool receives no traffic — say so, do not hide it. */
+.kpa-pool-chip--none {
+  background: color-mix(in srgb, var(--warn) 13%, transparent);
+  color: var(--warn);
+}
+
+.kpa-pool-chip > svg,
+.kpa-proxy-chip > svg {
+  flex: none;
+}
+
+.kpa-proxy-chip {
+  background: var(--proxy-soft);
+  color: var(--proxy);
+}
+
+.kpa-pool-chip__name,
 .kpa-proxy-chip__name {
   overflow: hidden;
   text-overflow: ellipsis;

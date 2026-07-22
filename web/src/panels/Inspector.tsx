@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Gauge as Gauge2, Link2, Trash2, Unlink } from 'lucide-react'
+import { AlertTriangle, ArrowLeftRight, Gauge as Gauge2, Link2, Trash2, Unlink } from 'lucide-react'
 import {
   ENTITY_KINDS,
   LATENCY_SCALE_MS,
@@ -14,6 +14,7 @@ import {
   formatRelativeTime,
   isServing,
   percent,
+  poolOfAccount,
 } from '@kpa/shared'
 import type {
   AccountEntity,
@@ -219,6 +220,115 @@ function AddRelation(props: {
   )
 }
 
+/**
+ * "Add member" picker for the pool inspector.
+ *
+ * An account belongs to at most one pool, so the candidates fall into two very
+ * different buckets: unassigned accounts are a plain add, accounts owned by
+ * another pool are a *move* (the server re-parents them on `bind`). They are
+ * grouped apart and the move is gated behind an inline confirmation so a
+ * mis-click can never silently steal an account from another pool.
+ */
+function AddPoolMember({ pool }: { pool: PoolEntity }): JSX.Element {
+  const state = useConsole((s) => s.state)
+  const bind = useConsole((s) => s.bind)
+  const [pending, setPending] = useState<{ account: AccountEntity; from: PoolEntity } | null>(null)
+
+  const { free, owned } = useMemo(() => {
+    const members = new Set(pool.members.map((m) => m.accountId))
+    const freeList: AccountEntity[] = []
+    const ownedList: { account: AccountEntity; from: PoolEntity }[] = []
+    for (const account of state.accounts) {
+      if (members.has(account.id)) continue
+      const owner = poolOfAccount(state, account.id)
+      if (owner && owner.id !== pool.id) ownedList.push({ account, from: owner })
+      else freeList.push(account)
+    }
+    return { free: freeList, owned: ownedList }
+  }, [state, pool])
+
+  // Never carry a confirmation across a selection change.
+  useEffect(() => {
+    setPending(null)
+  }, [pool.id])
+
+  const runBind = (accountId: string) => {
+    void bind({ kind: 'pool', id: pool.id }, { kind: 'account', id: accountId })
+  }
+
+  const onPick = (id: string) => {
+    const move = owned.find((entry) => entry.account.id === id)
+    if (move) {
+      setPending(move)
+      return
+    }
+    setPending(null)
+    runBind(id)
+  }
+
+  if (free.length === 0 && owned.length === 0) {
+    return <div className="kpa-insp-quiet kpa-insp-addnone">没有可加入的账号了</div>
+  }
+
+  return (
+    <>
+      <div className="kpa-insp-add">
+        <SelectField<string>
+          label="添加成员"
+          value=""
+          options={[{ value: '', label: '选择一个账号…' }]}
+          groups={[
+            {
+              label: '未分配的账号',
+              options: free.map((account) => ({ value: account.id, label: account.name })),
+            },
+            {
+              label: '属于其他池',
+              options: owned.map(({ account, from }) => ({
+                value: account.id,
+                label: `${account.name}（当前属于：${from.name}）`,
+              })),
+            },
+          ]}
+          onChange={(v) => {
+            if (v) onPick(v)
+          }}
+          hint={
+            owned.length > 0
+              ? '一个账号只能属于一个池；选中「属于其他池」里的账号会把它移入本池。'
+              : undefined
+          }
+        />
+        <Link2 size={12} className="kpa-insp-add-icon" />
+      </div>
+      {pending ? (
+        <div className="kpa-insp-confirm" role="group" aria-label="确认移入账号">
+          <p className="kpa-insp-confirm-text">
+            将从「{pending.from.name}」移入本池？「{pending.account.name}」会立即离开原来的池。
+          </p>
+          <div className="kpa-insp-confirm-actions">
+            <Button
+              size="sm"
+              variant="primary"
+              icon={<ArrowLeftRight size={12} />}
+              onClick={() => {
+                const target = pending
+                setPending(null)
+                runBind(target.account.id)
+              }}
+            >
+              确认移入
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setPending(null)}>
+              取消
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
 /* ------------------------------------------------------------------- key -- */
 
 function KeySections({ entity, update }: { entity: KeyEntity; update: Updater }): JSX.Element {
@@ -392,11 +502,7 @@ function KeySections({ entity, update }: { entity: KeyEntity; update: Updater })
 function PoolSections({ entity, update }: { entity: PoolEntity; update: Updater }): JSX.Element {
   const pools = useConsole((s) => s.state.pools)
   const accounts = useConsole((s) => s.state.accounts)
-  const bind = useConsole((s) => s.bind)
   const unbind = useConsole((s) => s.unbind)
-
-  const members = new Set(entity.members.map((m) => m.accountId))
-  const free = accounts.filter((a) => !members.has(a.id))
 
   // Send only the row that changed; the server merges it into the live array.
   const setMember = (accountId: string, patch: Partial<PoolMember>) => {
@@ -455,6 +561,9 @@ function PoolSections({ entity, update }: { entity: PoolEntity; update: Updater 
       </Section>
 
       <Section title="成员账号" dense>
+        <p className="kpa-insp-hint">
+          账号独占归属：一个账号同一时间只能属于一个池，加入本池即离开原来的池。
+        </p>
         {entity.members.length === 0 ? (
           <div className="kpa-insp-quiet">池内没有账号，命中该池的请求会以 no-account 失败。</div>
         ) : (
@@ -497,12 +606,7 @@ function PoolSections({ entity, update }: { entity: PoolEntity; update: Updater 
             )
           })
         )}
-        <AddRelation
-          label="添加成员"
-          placeholder="选择一个账号…"
-          options={free.map((a) => ({ value: a.id, label: a.name }))}
-          onPick={(id) => void bind({ kind: 'pool', id: entity.id }, { kind: 'account', id })}
-        />
+        <AddPoolMember pool={entity} />
       </Section>
     </>
   )
@@ -511,11 +615,30 @@ function PoolSections({ entity, update }: { entity: PoolEntity; update: Updater 
 /* --------------------------------------------------------------- account -- */
 
 function AccountSections({ entity, update }: { entity: AccountEntity; update: Updater }): JSX.Element {
+  const pools = useConsole((s) => s.state.pools)
   const proxies = useConsole((s) => s.state.proxies)
   const bind = useConsole((s) => s.bind)
   const unbind = useConsole((s) => s.unbind)
 
   const quotaPct = percent(entity.quota.usedTokens, entity.quota.limitTokens)
+
+  const owner = pools.find((p) => p.id === entity.poolId) ?? null
+
+  /*
+   * Membership is never PATCHed: `poolId` is a derived back-reference the
+   * server recomputes from `PoolEntity.members`, so it only ever moves through
+   * bind / unbind. Joining another pool is a single `bind` — the server treats
+   * it as a move and drops the account from its previous pool.
+   */
+  const onPoolChange = (next: string) => {
+    const current = entity.poolId ?? ''
+    if (current === next) return
+    if (next === '') {
+      if (current) void unbind({ kind: 'pool', id: current }, { kind: 'account', id: entity.id })
+      return
+    }
+    void bind({ kind: 'pool', id: next }, { kind: 'account', id: entity.id })
+  }
 
   const onProxyChange = (next: string) => {
     const current = entity.proxyId
@@ -528,6 +651,25 @@ function AccountSections({ entity, update }: { entity: AccountEntity; update: Up
 
   return (
     <>
+      <Section title="归属" dense>
+        <SelectField<string>
+          label="所属池"
+          value={entity.poolId ?? ''}
+          options={[
+            { value: '', label: '未分配' },
+            ...pools.map((p) => ({ value: p.id, label: p.name })),
+          ]}
+          onChange={onPoolChange}
+          hint="一个账号只能属于一个池；切换到别的池会把它整体移过去。"
+        />
+        {owner ? null : (
+          <p className="kpa-insp-warnhint">
+            <AlertTriangle size={11} />
+            <span>该账号未分配到任何池，加入一个池之前不会收到任何流量。</span>
+          </p>
+        )}
+      </Section>
+
       <Section title="凭证" dense>
         <SelectField<Provider>
           label="供应商"

@@ -291,6 +291,35 @@
   display: none;
 }
 
+/* The four cardinality rules, stated where the model is taught. */
+.kpa-pal-rules {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.kpa-pal-rule-row {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.kpa-pal-rule-row dt {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.kpa-pal-rule-row dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+}
+
 .kpa-pal-keys {
   display: flex;
   flex-direction: column;
@@ -459,6 +488,36 @@
   color: var(--warn);
 }
 
+/* An account belongs to at most one pool; belonging to none is legal but means
+   the account is a dead end, so the count is always on screen. */
+.kpa-pal-orphans {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+.kpa-pal-orphans-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.kpa-pal-orphans-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.kpa-pal-orphans[data-warn='true'] {
+  color: var(--warn);
+}
+
 /* ============================================================== inspector == */
 
 .kpa-inspector {
@@ -621,6 +680,49 @@
 }
 .kpa-insp-addnone {
   padding: var(--space-2) 0;
+}
+
+/* Inline confirmation for a re-parent: adding an account owned by another pool
+   moves it, so the operator must acknowledge it first. */
+.kpa-insp-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--pool);
+  border-radius: var(--radius);
+  background: var(--pool-soft);
+}
+
+.kpa-insp-confirm-text {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.kpa-insp-confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Muted warning under a field: legal state, but it has consequences. */
+.kpa-insp-warnhint {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+  color: var(--warn);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  opacity: 0.85;
+}
+
+.kpa-insp-warnhint > svg {
+  flex: none;
+  margin-top: 2px;
 }
 
 .kpa-insp-health {

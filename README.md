@@ -62,7 +62,7 @@ pnpm build            # 构建前端产物
 │   ├── index.ts                #   HTTP 路由 + WebSocket 广播 + 生命周期
 │   ├── simulator.ts            #   核心：按 tick 生成流量、routeRequest 全链路、重试/熔断/指标
 │   ├── store.ts                #   GraphStore：增删改查、绑定校验、状态重算
-│   ├── seed.ts                 #   种子拓扑：7 密钥 / 6 池 / 9 账号 / 6 代理
+│   ├── seed.ts                 #   种子拓扑：7 密钥 / 6 池 / 16 账号 / 7 代理
 │   └── rng.ts                  #   可复现的 mulberry32 随机数
 │
 └── web/src/                    # React 18 前端（Vite 6 + @xyflow/react 12 + zustand 5）
@@ -115,6 +115,24 @@ pnpm build            # 构建前端产物
 边只允许从左往右建立：`key → pool`、`pool → account`、`account → proxy`。
 从节点右侧的把手拖到下一列节点左侧的把手即可绑定；选中一条边按 `Delete` / `Backspace` 即可解绑。
 池的 `failoverPoolId` 会额外画一条虚线（标签「故障转移」）。
+
+### 四条基数约束（cardinality）
+
+三条链路边各有**固定且被服务端强制**的基数，顶栏的四枚徽标对应下面四条规则：
+
+| 关系 | 基数 | 权威存储 | 含义 |
+| --- | --- | --- | --- |
+| Key ↔ Pool | **多对多** | `KeyEntity.bindings` | 一个密钥可绑定多个池，一个池也可被多个密钥绑定 |
+| Pool → Account | **一对多** | `PoolEntity.members`（唯一真源） | 一个池独占持有多个账号 |
+| Account → Pool | **至多一个** | 同上（`account.poolId` 仅为派生反向引用） | 一个账号至多归属一个池，`0` 也是合法状态（未分配 / 未分配账号不接收任何流量） |
+| Account → Proxy | **多对一** | `AccountEntity.proxyId` | 一个账号至多绑定一个代理，一个代理可被多个账号共用 |
+
+核心不变式：**任一账号至多属于一个池**。`PoolEntity.members` 是唯一真源，
+`AccountEntity.poolId` 只是由 `store.syncAccountPoolRefs()` 在每次改动后重算的派生字段——
+`PATCH /api/entities/account` 会忽略客户端传入的 `poolId`，归属只能通过 bind/unbind
+或对池的 `members` 打补丁来改变。把一个池的连线拖到别的池已持有的账号上，是一次**迁移**
+（整体从旧池移到新池）而不是报错；未分配账号（`poolId=null`，如种子里的 `acc_free_1`）
+是合法且有意义的零状态，加入某个池之前不参与任何调度。
 
 ### 七种健康状态
 

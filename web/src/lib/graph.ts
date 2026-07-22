@@ -169,10 +169,17 @@ export function buildGraph(state: GraphState, opts: BuildGraphOptions): BuiltGra
   }))
 
   const edges: KpaEdge[] = []
+  // Every React Flow edge id must be unique. The account band already dedupes by
+  // owning pool, but the key band can still hand us two rows for the same
+  // key->pool pair (a regressed server, a momentarily inconsistent snapshot), so
+  // guard every edge id here — a duplicate key throws inside @xyflow's renderer.
+  const emittedEdgeIds = new Set<string>()
 
   const pushEdge = (source: Entity, targetId: string, data: EdgeSpec): void => {
     if (!known.has(targetId)) return
     const id = edgeId(source.id, targetId)
+    if (emittedEdgeIds.has(id)) return
+    emittedEdgeIds.add(id)
     edges.push({
       id,
       source: source.id,
@@ -201,9 +208,42 @@ export function buildGraph(state: GraphState, opts: BuildGraphOptions): BuiltGra
     }
   }
 
+  /*
+   * THE INVARIANT, enforced at render time: an account has at most one owning
+   * pool, so it may never have more than one incoming `pool-account` edge.
+   * `PoolEntity.members` stays the source of truth, but a snapshot that is
+   * momentarily inconsistent (or a server that regressed) must not paint two
+   * parents. `edgeOwner` resolves the winner once, up front: the derived
+   * `account.poolId` back-reference wins when it agrees with a membership row,
+   * otherwise the first pool in state order keeps the account and every other
+   * claim is dropped.
+   */
+  const edgeOwner = new Map<string, string>()
   for (const pool of known.values()) {
     if (pool.kind !== 'pool') continue
     for (const member of pool.members) {
+      const account = known.get(member.accountId)
+      if (account?.kind === 'account' && account.poolId === pool.id) {
+        edgeOwner.set(member.accountId, pool.id)
+      }
+    }
+  }
+  for (const pool of known.values()) {
+    if (pool.kind !== 'pool') continue
+    for (const member of pool.members) {
+      if (!edgeOwner.has(member.accountId)) edgeOwner.set(member.accountId, pool.id)
+    }
+  }
+
+  const emitted = new Set<string>()
+  for (const pool of known.values()) {
+    if (pool.kind !== 'pool') continue
+    for (const member of pool.members) {
+      // Claim on an account another pool already owns, or a repeated membership
+      // row inside this pool: either way it is a duplicate edge, so drop it.
+      if (edgeOwner.get(member.accountId) !== pool.id) continue
+      if (emitted.has(member.accountId)) continue
+      emitted.add(member.accountId)
       pushEdge(pool, member.accountId, {
         relation: 'pool-account',
         label: `w${member.weight}`,
@@ -320,9 +360,38 @@ function dagreOrder(state: GraphState): Map<string, number> | null {
 }
 
 /**
+ * Index of the pool that owns each account, for grouping the account band.
+ *
+ * Accounts with no pool sort after every pool (`state.pools.length`), which is
+ * what puts 未分配 accounts at the bottom of the band. The derived
+ * `account.poolId` back-reference is preferred; `PoolEntity.members` — the
+ * source of truth — fills in anything it does not resolve.
+ */
+function poolRankOf(state: GraphState): Map<string, number> {
+  const poolIndex = new Map(state.pools.map((pool, index) => [pool.id, index]))
+  const rank = new Map<string, number>()
+  for (const account of state.accounts) {
+    const index = account.poolId ? poolIndex.get(account.poolId) : undefined
+    if (index !== undefined) rank.set(account.id, index)
+  }
+  state.pools.forEach((pool, index) => {
+    for (const member of pool.members) {
+      if (!rank.has(member.accountId)) rank.set(member.accountId, index)
+    }
+  })
+  return rank
+}
+
+/**
  * Re-packs the whole graph onto the canonical band/lane grid. Entities keep the
  * order dagre suggests when it is available, otherwise their current top-to-
  * bottom order on the canvas.
+ *
+ * The account band is grouped by owning pool first (pools in state order,
+ * 未分配 last) so the one-pool-per-account forest reads as a forest instead of
+ * a tangle — the same order the server lays the seed data out in. Coordinates
+ * still come from `layoutSlots`, which owns lane wrapping (including the
+ * per-kind `LAYOUT.maxRowsPerLane` record), so this file only decides *order*.
  */
 export function autoLayout(state: GraphState): Record<string, XY> {
   const entities = allEntities(state)
@@ -331,10 +400,17 @@ export function autoLayout(state: GraphState): Record<string, XY> {
   const ranks = dagreOrder(state)
   const slots = layoutSlots(kindCounts(state))
   const columns = buckets(state)
+  const poolRank = poolRankOf(state)
+  const unassignedRank = state.pools.length
   const positions: Record<string, XY> = {}
 
   for (const kind of KIND_ORDER) {
     const ordered = columns[kind].slice().sort((a, b) => {
+      if (kind === 'account') {
+        const pa = poolRank.get(a.id) ?? unassignedRank
+        const pb = poolRank.get(b.id) ?? unassignedRank
+        if (pa !== pb) return pa - pb
+      }
       const ra = ranks?.get(a.id) ?? a.position.y
       const rb = ranks?.get(b.id) ?? b.position.y
       if (ra !== rb) return ra - rb

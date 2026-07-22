@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, type MouseEvent as ReactMouseEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from 'react'
 import {
   Background,
   BackgroundVariant,
@@ -17,13 +24,14 @@ import {
   type OnConnect,
   type OnNodeDrag,
 } from '@xyflow/react'
-import { Frame, LayoutGrid, Map as MapIcon, PlugZap, Route, SearchX } from 'lucide-react'
+import { ArrowLeftRight, Frame, LayoutGrid, Map as MapIcon, PlugZap, Route, SearchX } from 'lucide-react'
 
 import {
   KIND_LABEL_CN,
   KIND_ORDER,
   MIN_READABLE_ZOOM,
   edgeId,
+  poolOfAccount,
   type EntityKind,
   type GraphState,
   type XY,
@@ -45,6 +53,15 @@ const DEFAULT_EDGE_OPTIONS: DefaultEdgeOptions = { type: 'flow' }
 /** Breathing room kept around the graph when fitting it into the canvas. */
 const FIT_PADDING = 0.06
 /**
+ * The instance `minZoom` (0.4) is a legibility floor for the FIRST paint, where
+ * an unclamped fit lands around 0.29 and the cards become texture. But when the
+ * operator clicks 适应视图 / 自动布局 they have explicitly asked to see the whole
+ * graph, so those calls override the floor and are allowed to zoom out far
+ * enough to actually contain every node. `FitViewOptions.minZoom` wins over the
+ * instance value for that one call.
+ */
+const EXPLICIT_FIT_MIN_ZOOM = 0.2
+/**
  * Screen-space margin used when the opening view is clamped to a readable
  * zoom. Large enough that the first row of cards clears the legend pill in the
  * top-left corner instead of opening underneath it.
@@ -58,6 +75,18 @@ const NEXT_KIND: Partial<Record<EntityKind, EntityKind>> = {
   key: 'pool',
   pool: 'account',
   account: 'proxy',
+}
+
+/**
+ * One short line per band stating the cardinality of the relation it owns.
+ * The legend is where an operator learns the model, so the rules live here in
+ * plain 中文 rather than only in the docs.
+ */
+const CARDINALITY_HINT: Record<EntityKind, string> = {
+  key: '多对多绑定池',
+  pool: '独占持有多个账号',
+  account: '只归属一个池',
+  proxy: '可被多个账号共用',
 }
 
 const RELATION_TARGET_KIND: Record<FlowEdgeKind, EntityKind> = {
@@ -89,6 +118,15 @@ function collectBoundEdges(state: GraphState): Set<string> {
     if (account.proxyId) bound.add(edgeId(account.id, account.proxyId))
   }
   return bound
+}
+
+/** A pool -> account drop that would re-parent the account, awaiting confirmation. */
+interface PendingMove {
+  poolId: string
+  poolName: string
+  accountId: string
+  accountName: string
+  fromPoolName: string
 }
 
 function CanvasInner(): JSX.Element {
@@ -153,6 +191,42 @@ function CanvasInner(): JSX.Element {
 
   const [nodes, setNodes, onNodesChange] = useNodesState<KpaNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<KpaEdge>([])
+
+  /** Pending pool -> account re-parent awaiting the operator's confirmation. */
+  const [pendingMove, setPendingMove] = useState<PendingMove | null>(null)
+
+  /*
+   * The account band's pool-grouped ordering (what keeps the pool -> account
+   * forest crossing-free) is only recomputed by `autoLayout`. A re-parent
+   * through the UI leaves the account in its old slot, so a couple of edges can
+   * sweep back across the band. We can't silently re-layout — that would yank
+   * every card the operator has hand-placed — so instead we flag the ordering
+   * as stale whenever the account -> pool mapping changes, and nudge them to
+   * press 自动布局. The signature only changes on a genuine membership change,
+   * not on the ~4x/s health patches, so this effect stays quiet otherwise.
+   */
+  const membershipSig = useMemo(
+    () =>
+      state.accounts
+        .map((account) => `${account.id}:${account.poolId ?? ''}`)
+        .sort()
+        .join('|'),
+    [state.accounts],
+  )
+  const [layoutStale, setLayoutStale] = useState(false)
+  const lastMembershipSig = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!ready) return
+    if (lastMembershipSig.current === null) {
+      lastMembershipSig.current = membershipSig
+      return
+    }
+    if (lastMembershipSig.current !== membershipSig) {
+      lastMembershipSig.current = membershipSig
+      setLayoutStale(true)
+    }
+  }, [ready, membershipSig])
 
   /** Ids the operator is dragging right now: server patches must not fight them. */
   const draggingIds = useRef<Set<string>>(new Set())
@@ -302,15 +376,51 @@ function CanvasInner(): JSX.Element {
 
   const onNodeClick = useCallback<NodeMouseHandler<KpaNode>>(
     (_event, node) => {
+      setPendingMove(null)
       select(node.id)
     },
     [select],
   )
 
   const onPaneClick = useCallback(() => {
+    setPendingMove(null)
     select(null)
     setActiveTrace(null)
   }, [select, setActiveTrace])
+
+  const cancelMove = useCallback(() => {
+    setPendingMove(null)
+  }, [])
+
+  const confirmMove = useCallback(() => {
+    if (!pendingMove) return
+    const move = pendingMove
+    setPendingMove(null)
+    void bind({ kind: 'pool', id: move.poolId }, { kind: 'account', id: move.accountId })
+  }, [bind, pendingMove])
+
+  /*
+   * While the prompt is up, Escape belongs to it: the capture-phase listener
+   * runs before the app-wide Escape shortcut and swallows the event, so
+   * cancelling a re-parent does not also drop the current selection.
+   */
+  useEffect(() => {
+    if (!pendingMove) return
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      setPendingMove(null)
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [pendingMove])
+
+  // Drop a stale prompt when either side of the move disappears from the graph.
+  useEffect(() => {
+    if (!pendingMove) return
+    if (kindOf.has(pendingMove.poolId) && kindOf.has(pendingMove.accountId)) return
+    setPendingMove(null)
+  }, [pendingMove, kindOf])
 
   const onNodeDragStart = useCallback<OnNodeDrag<KpaNode>>((_event, node, dragged) => {
     draggingIds.current.add(node.id)
@@ -329,6 +439,13 @@ function CanvasInner(): JSX.Element {
     [moveEntity],
   )
 
+  /*
+   * A pool -> account drop stays VALID even when the account already belongs to
+   * another pool: that drop is a *move*, which is the intended way to re-parent
+   * an account on the canvas. It can never produce a second incoming pool edge,
+   * because `buildGraph` renders exactly one owning pool per account. The only
+   * pool -> account drop rejected here is the one that already exists.
+   */
   const isValidConnection = useCallback<IsValidConnection<KpaEdge>>(
     (candidate) => {
       const { source, target } = candidate
@@ -352,9 +469,27 @@ function CanvasInner(): JSX.Element {
       // isValidConnection already rejects it visually while dragging.
       if (!sourceKind || !targetKind) return
       if (NEXT_KIND[sourceKind] !== targetKind) return
+
+      if (sourceKind === 'pool' && targetKind === 'account') {
+        // An account belongs to at most one pool, so binding it to a second one
+        // MOVES it out of the first. That is a destructive edit for the pool
+        // losing the account, so it is confirmed instead of applied silently.
+        const current = poolOfAccount(state, target)
+        if (current && current.id !== source) {
+          setPendingMove({
+            poolId: source,
+            poolName: state.pools.find((p) => p.id === source)?.name ?? source,
+            accountId: target,
+            accountName: state.accounts.find((a) => a.id === target)?.name ?? target,
+            fromPoolName: current.name,
+          })
+          return
+        }
+      }
+
       void bind({ kind: sourceKind, id: source }, { kind: targetKind, id: target })
     },
-    [bind, kindOf],
+    [bind, kindOf, state],
   )
 
   const onEdgeClick = useCallback(
@@ -398,6 +533,9 @@ function CanvasInner(): JSX.Element {
   /* ------------------------------------------------------------- chrome -- */
 
   const handleAutoLayout = useCallback(() => {
+    // Re-running the layout re-groups the account band by owning pool, which is
+    // exactly what clears the "ordering went stale" state.
+    setLayoutStale(false)
     const positions: Record<string, XY> = autoLayout(state)
     setNodes((prev) =>
       prev.map((node) => {
@@ -409,12 +547,12 @@ function CanvasInner(): JSX.Element {
       void moveEntity(id, position)
     }
     window.setTimeout(() => {
-      void fitView({ padding: FIT_PADDING, duration: 320})
+      void fitView({ padding: FIT_PADDING, duration: 320, minZoom: EXPLICIT_FIT_MIN_ZOOM })
     }, 80)
   }, [state, setNodes, moveEntity, fitView])
 
   const handleFitView = useCallback(() => {
-    void fitView({ padding: FIT_PADDING, duration: 320})
+    void fitView({ padding: FIT_PADDING, duration: 320, minZoom: EXPLICIT_FIT_MIN_ZOOM })
   }, [fitView])
 
   const clearFilters = useCallback(() => {
@@ -489,16 +627,21 @@ function CanvasInner(): JSX.Element {
                 data-filtered={derived.filtered ? 'true' : undefined}
                 title={
                   derived.filtered
-                    ? `${KIND_LABEL_CN[kind]}：${derived.visible[kind]} / ${derived.total[kind]} 可见`
-                    : `${KIND_LABEL_CN[kind]} ${derived.total[kind]}`
+                    ? `${KIND_LABEL_CN[kind]}：${derived.visible[kind]} / ${derived.total[kind]} 可见 · ${CARDINALITY_HINT[kind]}`
+                    : `${KIND_LABEL_CN[kind]} ${derived.total[kind]} · ${CARDINALITY_HINT[kind]}`
                 }
               >
                 <span className="kpa-legend__swatch" />
-                <span className="kpa-legend__label">{KIND_LABEL_CN[kind]}</span>
-                <span className="kpa-legend__count">
-                  {derived.filtered
-                    ? `${derived.visible[kind]} / ${derived.total[kind]}`
-                    : derived.total[kind]}
+                <span className="kpa-legend__text">
+                  <span className="kpa-legend__line">
+                    <span className="kpa-legend__label">{KIND_LABEL_CN[kind]}</span>
+                    <span className="kpa-legend__count">
+                      {derived.filtered
+                        ? `${derived.visible[kind]} / ${derived.total[kind]}`
+                        : derived.total[kind]}
+                    </span>
+                  </span>
+                  <span className="kpa-legend__rule">{CARDINALITY_HINT[kind]}</span>
                 </span>
               </div>
             </div>
@@ -512,8 +655,42 @@ function CanvasInner(): JSX.Element {
           ) : null}
         </Panel>
 
+        {pendingMove ? (
+          <Panel position="top-center" className="kpa-move-confirm">
+            <span className="kpa-move-confirm__icon" aria-hidden="true">
+              <ArrowLeftRight size={13} />
+            </span>
+            <span className="kpa-move-confirm__text">
+              <b>「{pendingMove.accountName}」当前属于「{pendingMove.fromPoolName}」</b>
+              <span>
+                一个账号只能属于一个池。确认后它会离开「{pendingMove.fromPoolName}」，改由「
+                {pendingMove.poolName}」持有。
+              </span>
+            </span>
+            <span className="kpa-move-confirm__actions">
+              <Button size="sm" variant="primary" onClick={confirmMove}>
+                确认移入
+              </Button>
+              <Button size="sm" variant="subtle" onClick={cancelMove} title="按 Esc 也可以取消">
+                取消
+              </Button>
+            </span>
+          </Panel>
+        ) : null}
+
         <Panel position="bottom-right" className="kpa-canvas-tools">
-          <Button size="sm" variant="subtle" icon={<LayoutGrid size={12} />} onClick={handleAutoLayout} title="按列重新排布所有节点">
+          {layoutStale ? (
+            <span className="kpa-canvas-tools__hint" role="status">
+              归属已变更，点击自动布局重新排列
+            </span>
+          ) : null}
+          <Button
+            size="sm"
+            variant={layoutStale ? 'primary' : 'subtle'}
+            icon={<LayoutGrid size={12} />}
+            onClick={handleAutoLayout}
+            title="按列重新排布所有节点"
+          >
             自动布局
           </Button>
           <Button size="sm" variant="subtle" icon={<Frame size={12} />} onClick={handleFitView} title="缩放到全部节点">

@@ -52,6 +52,9 @@ function broadcast(event: ServerEvent): void {
 }
 
 const store = new GraphStore()
+// Re-parenting an account (bind pool -> account when another pool owned it) has
+// to be visible to the operator, so the store gets a channel onto the log panel.
+store.setLogSink((level, message) => broadcast({ type: 'log', level, message, at: Date.now() }))
 const simulator = new Simulator(store, broadcast)
 
 /** Push everything the last mutation touched to every console. */
@@ -174,7 +177,13 @@ api.post(
   '/entities/:id/move',
   route((req, res) => {
     const payload = body(req)
-    const id = typeof payload.id === 'string' && payload.id ? payload.id : req.params.id
+    // The URL path is the sole authority for *which* entity moves. A body `id`
+    // that disagrees is rejected rather than silently overriding the path,
+    // which would make request logs lie about what was mutated.
+    const id = req.params.id
+    if (typeof payload.id === 'string' && payload.id && payload.id !== id) {
+      throw new HttpError(400, `路径 id (${id}) 与请求体 id (${payload.id}) 不一致`)
+    }
     if (!store.get(id)) throw new HttpError(404, `实体不存在: ${id}`)
     const entity = store.move(id, parsePosition(payload.position))
     flushPatches()

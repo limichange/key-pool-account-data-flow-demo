@@ -111,6 +111,30 @@ export interface KeyEntity extends BaseEntity {
 
 /* ----------------------------------------------------------------- pool -- */
 
+/**
+ * ============================ CARDINALITY ============================
+ * The four relations of the chain have a fixed, enforced cardinality:
+ *
+ *   Key     <-> Pool       MANY-TO-MANY  one key binds several pools;
+ *                                        one pool is bound by several keys.
+ *                                        Stored on `KeyEntity.bindings`.
+ *
+ *   Pool     -> Account    ONE-TO-MANY   a pool owns several accounts, but
+ *                                        AN ACCOUNT BELONGS TO AT MOST ONE POOL.
+ *                                        Stored on `PoolEntity.members`, which
+ *                                        is the SINGLE SOURCE OF TRUTH.
+ *
+ *   Account  -> Proxy      MANY-TO-ONE   an account has at most one proxy;
+ *                                        a proxy may serve several accounts.
+ *                                        Stored on `AccountEntity.proxyId`.
+ *
+ * THE INVARIANT: for every AccountEntity `a`, the number of PoolEntity `p`
+ * with `p.members.some(m => m.accountId === a.id)` is 0 or 1. Zero is a legal,
+ * meaningful state — an "unassigned" (未分配) account that receives no traffic.
+ * The server enforces this on every mutating path (see `GraphStore`).
+ * =====================================================================
+ */
+
 export type RoutingStrategy =
   | 'round-robin'
   | 'weighted'
@@ -138,6 +162,12 @@ export interface PoolMember {
 export interface PoolEntity extends BaseEntity {
   kind: 'pool'
   strategy: RoutingStrategy
+  /**
+   * The pool's accounts, in routing order. AUTHORITATIVE for the Pool -> Account
+   * relation: `AccountEntity.poolId` is only a cached back-reference derived
+   * from these arrays. An accountId may appear in at most one pool's `members`
+   * across the whole graph.
+   */
   members: PoolMember[]
   /** Route a session to the same account when possible. */
   stickySession: boolean
@@ -168,8 +198,23 @@ export interface AccountHealth {
   lastError: string | null
 }
 
+/**
+ * An upstream credential. See the CARDINALITY block above `PoolEntity`:
+ * an account belongs to AT MOST ONE pool and has AT MOST ONE proxy.
+ */
 export interface AccountEntity extends BaseEntity {
   kind: 'account'
+  /**
+   * Owning pool, or `null` when the account is unassigned (未分配) and receives
+   * no traffic.
+   *
+   * DERIVED, never authoritative: it is recomputed from `PoolEntity.members` by
+   * `GraphStore.syncAccountPoolRefs()` after every mutation that can touch
+   * membership. Nothing else may write it — in particular
+   * `PATCH /api/entities/account/:id` ignores a client-supplied `poolId`;
+   * membership changes only through bind/unbind or a pool `members` patch.
+   */
+  poolId: string | null
   provider: Provider
   credentialType: CredentialType
   /** Masked credential, e.g. `sk-ant-api03-****9c1d`. */

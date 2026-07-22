@@ -3,8 +3,28 @@
  *
  * The shape is intentionally opinionated: every routing strategy is visible on
  * screen at once, one account starts near quota exhaustion, one account is
- * disabled and one proxy is dead, so that failure paths light up within a few
- * seconds of watching the canvas.
+ * disabled, one account already sits behind a dead proxy and one pool is weak
+ * enough that its `failoverPoolId` actually fires — so failure paths light up
+ * within a few seconds of watching the canvas.
+ *
+ * CARDINALITY (see shared/src/types.ts): Pool -> Account is ONE-TO-MANY, so the
+ * six pools each own their OWN accounts and no account is shared. The partition
+ * is 3/3/3/2/2/2 plus exactly one deliberately unassigned account:
+ *
+ *   pool_main    weighted           acc_ant_1  acc_ant_2  acc_ant_3
+ *   pool_backup  priority-failover  acc_ant_4  acc_ant_5  acc_bed_1
+ *   pool_gpt     round-robin        acc_oai_1  acc_oai_2  acc_oai_3
+ *   pool_cn      least-latency      acc_ds_1   acc_gem_1
+ *   pool_lab     least-used         acc_gem_2  acc_azu_1
+ *   pool_shadow  random             acc_ds_2   acc_bed_2
+ *   (none)                          acc_free_1                      <- 未分配
+ *
+ * The `accounts` array below is written in exactly that order — owning pool
+ * first (pools in `state.pools` order), unassigned last — because index order
+ * IS layout order: `layoutSlots` places the i-th account in the i-th slot of the
+ * account band. Since every account has at most one parent the pool->account
+ * edges form a forest, and this ordering makes that forest render with almost
+ * no edge crossings. Keep the two orders in sync when editing.
  */
 import {
   createMetrics,
@@ -46,6 +66,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
   const resetAt = now + 45 * MINUTE
 
   /* ------------------------------------------------------------- proxies -- */
+  // Account -> Proxy is MANY-TO-ONE, so every live proxy is shared by two or
+  // three accounts and two accounts run 直连 (no proxy at all).
 
   const proxies: ProxyEntity[] = [
     {
@@ -55,7 +77,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['主力', 'datacenter'],
-      note: '主力出口，承载 Anthropic / OpenAI 生产账号。',
+      note: '主力出口，同时承载 Anthropic / OpenAI / Bedrock 三个账号。',
       createdAt: now - 96 * DAY,
       updatedAt: now - 2 * HOUR,
       position: { x: 0, y: 0 },
@@ -78,7 +100,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['residential', '低风控'],
-      note: '住宅 IP，风控友好，但抖动较大。',
+      note: '住宅 IP，风控友好，但抖动较大；主号 B 与影子号共用。',
       createdAt: now - 74 * DAY,
       updatedAt: now - 5 * HOUR,
       position: { x: 0, y: 0 },
@@ -118,13 +140,36 @@ export function createSeedState(now: number = Date.now()): GraphState {
       baseLatencyMs: 180,
     },
     {
+      id: 'px_uk_1',
+      kind: 'proxy',
+      name: '伦敦 · 备份出口',
+      enabled: true,
+      status: 'healthy',
+      tags: ['备份', 'datacenter'],
+      note: '欧洲备份出口，冷备号与 Azure 实验号共用。',
+      createdAt: now - 44 * DAY,
+      updatedAt: now - 70 * MINUTE,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      protocol: 'https',
+      host: 'eu-lon.egress.limi.net',
+      port: 8443,
+      region: 'eu-west-2',
+      countryCode: 'GB',
+      poolType: 'datacenter',
+      maxConcurrency: 100,
+      health: { latencyMs: 152, alive: true, packetLoss: 0.007, lastCheckAt: now - 18_000 },
+      reliability: 0.984,
+      baseLatencyMs: 150,
+    },
+    {
       id: 'px_sg_1',
       kind: 'proxy',
       name: '新加坡 · 亚太中转',
       enabled: true,
       status: 'healthy',
       tags: ['亚太', 'datacenter'],
-      note: '亚太主中转，备用账号默认走这里。',
+      note: '亚太主中转，DeepSeek 主账号与备用号共用。',
       createdAt: now - 41 * DAY,
       updatedAt: now - 3 * HOUR,
       position: { x: 0, y: 0 },
@@ -147,7 +192,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['mobile', '高抖动'],
-      note: '4G 移动出口，延迟抖动明显，偶发丢包。',
+      note: '4G 移动出口，延迟抖动明显，两个 Gemini 项目号共用。',
       createdAt: now - 27 * DAY,
       updatedAt: now - 45 * MINUTE,
       position: { x: 0, y: 0 },
@@ -170,7 +215,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'offline',
       tags: ['故障', 'datacenter'],
-      note: '上游机房断线，健康检查连续失败，等待运维处理。',
+      note: '上游机房断线，健康检查连续失败，绑定它的账号会在代理层直接失败。',
       createdAt: now - 63 * DAY,
       updatedAt: now - 6 * MINUTE,
       position: { x: 0, y: 0 },
@@ -189,8 +234,13 @@ export function createSeedState(now: number = Date.now()): GraphState {
   ]
 
   /* ------------------------------------------------------------ accounts -- */
+  // ORDERED BY OWNING POOL (pools in state order), unassigned last — index order
+  // is layout order, see the file header. `poolId` is the DERIVED back-reference
+  // of `PoolEntity.members` below; the store recomputes it on boot, so the two
+  // must agree here or the seed is simply wrong.
 
   const accounts: AccountEntity[] = [
+    /* -- pool_main · 主力池 Claude · weighted ---------------------------- */
     {
       id: 'acc_ant_1',
       kind: 'account',
@@ -198,11 +248,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['生产', '高配额'],
-      note: '企业合同账号，配额最大，优先承接生产流量。',
+      note: '企业合同账号，配额最大，主力池里权重最高。',
       createdAt: now - 120 * DAY,
       updatedAt: now - 20 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_main',
       provider: 'anthropic',
       credentialType: 'api-key',
       credentialMask: 'sk-ant-api03-****f21a',
@@ -234,6 +285,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       updatedAt: now - 55 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_main',
       provider: 'anthropic',
       credentialType: 'oauth',
       credentialMask: 'oauth-ant-****7be3',
@@ -254,17 +306,19 @@ export function createSeedState(now: number = Date.now()): GraphState {
       models: ['claude-opus-4-8', 'claude-sonnet-5'],
     },
     {
+      // Demo state #1: this account is about to run out of tokens.
       id: 'acc_ant_3',
       kind: 'account',
       name: 'Anthropic 团队号 EU',
       enabled: true,
       status: 'healthy',
       tags: ['欧盟', '配额告急'],
-      note: '欧洲团队共享账号，本窗口配额即将耗尽。',
+      note: '欧洲团队共享账号，本窗口配额即将耗尽，很快会退出调度。',
       createdAt: now - 77 * DAY,
       updatedAt: now - 4 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_main',
       provider: 'anthropic',
       credentialType: 'session',
       credentialMask: 'sess-ant-eu-****0c4d',
@@ -284,7 +338,13 @@ export function createSeedState(now: number = Date.now()): GraphState {
       baseLatencyMs: 1150,
       models: ['claude-sonnet-5', 'claude-opus-4-8'],
     },
+
+    /* -- pool_backup · 备用池 Claude · priority-failover ------------------ */
+    // All three members are deliberately weak: one manually disabled, one out of
+    // quota and one behind the dead 香港 proxy. The pool therefore burns its
+    // retries and spills over to `pool_main` through `failoverPoolId`.
     {
+      // Demo state #2: manually switched off by the operator.
       id: 'acc_ant_4',
       kind: 'account',
       name: 'Anthropic 备用号 AP',
@@ -296,6 +356,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       updatedAt: now - 18 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_backup',
       provider: 'anthropic',
       credentialType: 'api-key',
       credentialMask: 'sk-ant-api03-****91d7',
@@ -316,6 +377,73 @@ export function createSeedState(now: number = Date.now()): GraphState {
       models: ['claude-sonnet-5'],
     },
     {
+      // Demo state #3: quota already fully consumed -> status `exhausted`.
+      id: 'acc_ant_5',
+      kind: 'account',
+      name: 'Anthropic 冷备号 UK',
+      enabled: true,
+      status: 'exhausted',
+      tags: ['冷备', '配额耗尽'],
+      note: '本窗口 token 已经用完，等待配额重置后才会重新参与调度。',
+      createdAt: now - 51 * DAY,
+      updatedAt: now - 26 * MINUTE,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      poolId: 'pool_backup',
+      provider: 'anthropic',
+      credentialType: 'api-key',
+      credentialMask: 'sk-ant-api03-****5e8b',
+      region: 'eu-west-2',
+      proxyId: 'px_uk_1',
+      rateLimit: { rpm: 90, concurrency: 12 },
+      quota: { limitTokens: 1_500_000, usedTokens: 1_500_000, resetAt: now + 33 * MINUTE },
+      health: {
+        latencyMs: 1650,
+        errorRate: 0.052,
+        consecutiveFailures: 0,
+        cooldownUntil: null,
+        lastErrorAt: now - 26 * MINUTE,
+        lastError: '上游 402 quota_exceeded',
+      },
+      reliability: 0.951,
+      baseLatencyMs: 1600,
+      models: ['claude-sonnet-5'],
+    },
+    {
+      id: 'acc_bed_1',
+      kind: 'account',
+      name: 'Bedrock 跨区号',
+      enabled: true,
+      status: 'healthy',
+      tags: ['bedrock', '链路异常'],
+      note: '绑定的香港中转已经断线，请求会在代理层失败并触发备用池溢出。',
+      createdAt: now - 88 * DAY,
+      updatedAt: now - 7 * MINUTE,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      poolId: 'pool_backup',
+      provider: 'bedrock',
+      credentialType: 'api-key',
+      credentialMask: 'AKIA****QZ7X',
+      region: 'ap-east-1',
+      proxyId: 'px_hk_1',
+      rateLimit: { rpm: 200, concurrency: 24 },
+      quota: { limitTokens: 9_000_000, usedTokens: 1_880_000, resetAt },
+      health: {
+        latencyMs: 1420,
+        errorRate: 0.14,
+        consecutiveFailures: 2,
+        cooldownUntil: null,
+        lastErrorAt: now - 7 * MINUTE,
+        lastError: '代理不可达',
+      },
+      reliability: 0.972,
+      baseLatencyMs: 1400,
+      models: ['claude-sonnet-5', 'claude-opus-4-8'],
+    },
+
+    /* -- pool_gpt · GPT 池 · round-robin ---------------------------------- */
+    {
       id: 'acc_oai_1',
       kind: 'account',
       name: 'OpenAI 生产号',
@@ -327,6 +455,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       updatedAt: now - 70 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_gpt',
       provider: 'openai',
       credentialType: 'api-key',
       credentialMask: 'sk-proj-****3a09',
@@ -358,6 +487,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       updatedAt: now - 2 * HOUR,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_gpt',
       provider: 'openai',
       credentialType: 'api-key',
       credentialMask: 'sk-proj-****ce62',
@@ -378,36 +508,39 @@ export function createSeedState(now: number = Date.now()): GraphState {
       models: ['gpt-5.1'],
     },
     {
-      id: 'acc_gem_1',
+      id: 'acc_oai_3',
       kind: 'account',
-      name: 'Gemini 项目号',
+      name: 'OpenAI 欧洲号',
       enabled: true,
       status: 'healthy',
-      tags: ['低成本', 'gemini'],
-      note: 'GCP 项目绑定，延迟低、价格便宜，用于兜底。',
-      createdAt: now - 35 * DAY,
-      updatedAt: now - 12 * MINUTE,
+      tags: ['欧盟', 'gpt'],
+      note: '欧盟数据驻留账号，经法兰克福出口访问。',
+      createdAt: now - 58 * DAY,
+      updatedAt: now - 37 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
-      provider: 'gemini',
-      credentialType: 'oauth',
-      credentialMask: 'gcp-sa-****4f18',
-      region: 'asia-northeast1',
-      proxyId: 'px_jp_1',
-      rateLimit: { rpm: 240, concurrency: 32 },
-      quota: { limitTokens: 10_000_000, usedTokens: 2_460_000, resetAt },
+      poolId: 'pool_gpt',
+      provider: 'openai',
+      credentialType: 'api-key',
+      credentialMask: 'sk-proj-****7d41',
+      region: 'eu-central-1',
+      proxyId: 'px_de_1',
+      rateLimit: { rpm: 200, concurrency: 24 },
+      quota: { limitTokens: 7_000_000, usedTokens: 2_400_000, resetAt },
       health: {
-        latencyMs: 700,
-        errorRate: 0.017,
+        latencyMs: 1090,
+        errorRate: 0.019,
         consecutiveFailures: 0,
         cooldownUntil: null,
-        lastErrorAt: now - 51 * MINUTE,
+        lastErrorAt: now - 62 * MINUTE,
         lastError: null,
       },
-      reliability: 0.976,
-      baseLatencyMs: 690,
-      models: ['gemini-3-pro'],
+      reliability: 0.978,
+      baseLatencyMs: 1080,
+      models: ['gpt-5.1'],
     },
+
+    /* -- pool_cn · 国产模型池 · least-latency ----------------------------- */
     {
       id: 'acc_ds_1',
       kind: 'account',
@@ -420,6 +553,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       updatedAt: now - 8 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_cn',
       provider: 'deepseek',
       credentialType: 'api-key',
       credentialMask: 'sk-ds-****b7a5',
@@ -440,39 +574,212 @@ export function createSeedState(now: number = Date.now()): GraphState {
       models: ['deepseek-v4'],
     },
     {
-      id: 'acc_bed_1',
+      id: 'acc_gem_1',
       kind: 'account',
-      name: 'Bedrock 跨区号',
+      name: 'Gemini 项目号',
       enabled: true,
       status: 'healthy',
-      tags: ['bedrock', '链路异常'],
-      note: '绑定的香港中转已经断线，请求会在代理层失败。',
-      createdAt: now - 88 * DAY,
-      updatedAt: now - 7 * MINUTE,
+      tags: ['低成本', 'gemini'],
+      note: 'GCP 项目绑定，延迟低、价格便宜，是国产池里延迟最低的成员。',
+      createdAt: now - 35 * DAY,
+      updatedAt: now - 12 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
+      poolId: 'pool_cn',
+      provider: 'gemini',
+      credentialType: 'oauth',
+      credentialMask: 'gcp-sa-****4f18',
+      region: 'asia-northeast1',
+      proxyId: 'px_jp_1',
+      rateLimit: { rpm: 240, concurrency: 32 },
+      quota: { limitTokens: 10_000_000, usedTokens: 2_460_000, resetAt },
+      health: {
+        latencyMs: 700,
+        errorRate: 0.017,
+        consecutiveFailures: 0,
+        cooldownUntil: null,
+        lastErrorAt: now - 51 * MINUTE,
+        lastError: null,
+      },
+      reliability: 0.976,
+      baseLatencyMs: 690,
+      models: ['gemini-3-pro'],
+    },
+
+    /* -- pool_lab · 实验池 · least-used ----------------------------------- */
+    {
+      id: 'acc_gem_2',
+      kind: 'account',
+      name: 'Gemini 实验项目号',
+      enabled: true,
+      status: 'healthy',
+      tags: ['实验', 'gemini'],
+      note: '离线评测专用的第二个 GCP 项目，额度小但很稳定。',
+      createdAt: now - 19 * DAY,
+      updatedAt: now - 16 * MINUTE,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      poolId: 'pool_lab',
+      provider: 'gemini',
+      credentialType: 'oauth',
+      credentialMask: 'gcp-sa-****9a27',
+      region: 'asia-northeast1',
+      proxyId: 'px_jp_1',
+      rateLimit: { rpm: 120, concurrency: 16 },
+      quota: { limitTokens: 5_000_000, usedTokens: 860_000, resetAt },
+      health: {
+        latencyMs: 840,
+        errorRate: 0.021,
+        consecutiveFailures: 0,
+        cooldownUntil: null,
+        lastErrorAt: now - 44 * MINUTE,
+        lastError: null,
+      },
+      reliability: 0.968,
+      baseLatencyMs: 830,
+      models: ['gemini-3-pro'],
+    },
+    {
+      id: 'acc_azu_1',
+      kind: 'account',
+      name: 'Azure OpenAI 实验号',
+      enabled: true,
+      status: 'healthy',
+      tags: ['实验', 'azure'],
+      note: 'Azure 部署，配额独立于 OpenAI 官方账号，用来拉平实验成本。',
+      createdAt: now - 24 * DAY,
+      updatedAt: now - 29 * MINUTE,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      poolId: 'pool_lab',
+      provider: 'azure',
+      credentialType: 'api-key',
+      credentialMask: 'azure-****13cf',
+      region: 'uksouth',
+      proxyId: 'px_uk_1',
+      rateLimit: { rpm: 180, concurrency: 24 },
+      quota: { limitTokens: 6_000_000, usedTokens: 1_440_000, resetAt },
+      health: {
+        latencyMs: 1030,
+        errorRate: 0.011,
+        consecutiveFailures: 0,
+        cooldownUntil: null,
+        lastErrorAt: null,
+        lastError: null,
+      },
+      reliability: 0.985,
+      baseLatencyMs: 1020,
+      models: ['gpt-5.1'],
+    },
+
+    /* -- pool_shadow · 影子池 · random ------------------------------------ */
+    {
+      id: 'acc_ds_2',
+      kind: 'account',
+      name: 'DeepSeek 影子号',
+      enabled: true,
+      status: 'healthy',
+      tags: ['影子', '国产'],
+      note: '专供影子流量的第二个 DeepSeek 账号，走美东住宅出口。',
+      createdAt: now - 11 * DAY,
+      updatedAt: now - 23 * MINUTE,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      poolId: 'pool_shadow',
+      provider: 'deepseek',
+      credentialType: 'api-key',
+      credentialMask: 'sk-ds-****31e0',
+      region: 'cn-north-1',
+      proxyId: 'px_us_2',
+      rateLimit: { rpm: 120, concurrency: 16 },
+      quota: { limitTokens: 8_000_000, usedTokens: 1_200_000, resetAt },
+      health: {
+        latencyMs: 790,
+        errorRate: 0.046,
+        consecutiveFailures: 0,
+        cooldownUntil: null,
+        lastErrorAt: now - 14 * MINUTE,
+        lastError: '上游 503 service_unavailable',
+      },
+      reliability: 0.941,
+      baseLatencyMs: 760,
+      models: ['deepseek-v4'],
+    },
+    {
+      id: 'acc_bed_2',
+      kind: 'account',
+      name: 'Bedrock 影子号',
+      enabled: true,
+      status: 'healthy',
+      tags: ['影子', 'bedrock'],
+      note: '美西 Bedrock 部署，用来给影子流量提供第二个上游供应商。',
+      createdAt: now - 16 * DAY,
+      updatedAt: now - 35 * MINUTE,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      poolId: 'pool_shadow',
       provider: 'bedrock',
       credentialType: 'api-key',
-      credentialMask: 'AKIA****QZ7X',
-      region: 'ap-east-1',
-      proxyId: 'px_hk_1',
-      rateLimit: { rpm: 200, concurrency: 24 },
-      quota: { limitTokens: 9_000_000, usedTokens: 1_880_000, resetAt },
+      credentialMask: 'AKIA****4M2P',
+      region: 'us-west-2',
+      proxyId: 'px_us_1',
+      rateLimit: { rpm: 160, concurrency: 20 },
+      quota: { limitTokens: 6_000_000, usedTokens: 980_000, resetAt },
       health: {
-        latencyMs: 1420,
-        errorRate: 0.14,
-        consecutiveFailures: 2,
+        latencyMs: 1250,
+        errorRate: 0.024,
+        consecutiveFailures: 0,
         cooldownUntil: null,
-        lastErrorAt: now - 7 * MINUTE,
-        lastError: '代理不可达',
+        lastErrorAt: now - 58 * MINUTE,
+        lastError: null,
       },
-      reliability: 0.972,
-      baseLatencyMs: 1400,
+      reliability: 0.967,
+      baseLatencyMs: 1240,
+      models: ['claude-sonnet-5'],
+    },
+
+    /* -- unassigned · 未分配 ---------------------------------------------- */
+    {
+      // Demo state #4: a legal, meaningful zero — this account belongs to NO
+      // pool, so it receives no traffic at all until an operator drags a pool
+      // edge onto it. `poolId` must stay null and no pool may list it.
+      id: 'acc_free_1',
+      kind: 'account',
+      name: 'Anthropic 新采购号',
+      enabled: true,
+      status: 'healthy',
+      tags: ['未分配', '待接入'],
+      note: '本周新采购、尚未加入任何池，当前不接收任何流量。拖一条池的连线到它即可接入。',
+      createdAt: now - 2 * DAY,
+      updatedAt: now - 2 * DAY,
+      position: { x: 0, y: 0 },
+      metrics: createMetrics(),
+      poolId: null,
+      provider: 'anthropic',
+      credentialType: 'api-key',
+      credentialMask: 'sk-ant-api03-****a604',
+      region: 'us-west-2',
+      proxyId: null,
+      rateLimit: { rpm: 300, concurrency: 40 },
+      quota: { limitTokens: 12_000_000, usedTokens: 0, resetAt },
+      health: {
+        latencyMs: 880,
+        errorRate: 0,
+        consecutiveFailures: 0,
+        cooldownUntil: null,
+        lastErrorAt: null,
+        lastError: null,
+      },
+      reliability: 0.992,
+      baseLatencyMs: 880,
       models: ['claude-sonnet-5', 'claude-opus-4-8'],
     },
   ]
 
   /* --------------------------------------------------------------- pools -- */
+  // One pool per routing strategy so all six stay visible on one screen, and —
+  // Pool -> Account being one-to-many — each pool owns a disjoint slice of the
+  // account roster: 3 / 3 / 3 / 2 / 2 / 2.
 
   const pools: PoolEntity[] = [
     {
@@ -482,7 +789,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['生产', 'weighted'],
-      note: '按权重分配生产流量，全部成员不可用时溢出到备用池。',
+      note: '按权重分配生产流量，三个自有 Anthropic 账号，全部不可用时溢出到备用池。',
       createdAt: now - 120 * DAY,
       updatedAt: now - 25 * MINUTE,
       position: { x: 0, y: 0 },
@@ -492,7 +799,6 @@ export function createSeedState(now: number = Date.now()): GraphState {
         { accountId: 'acc_ant_1', weight: 5, priority: 1, enabled: true },
         { accountId: 'acc_ant_2', weight: 3, priority: 2, enabled: true },
         { accountId: 'acc_ant_3', weight: 2, priority: 3, enabled: true },
-        { accountId: 'acc_bed_1', weight: 1, priority: 4, enabled: true },
       ],
       stickySession: false,
       maxRetries: 2,
@@ -507,7 +813,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'degraded',
       tags: ['备用', 'failover'],
-      note: '按优先级逐级接管，首选账号已停用，实际由次优账号兜底。',
+      note: '按优先级逐级接管：首选已停用、次选配额耗尽、第三个的代理断线，因此几乎必然溢出到主力池。',
       createdAt: now - 90 * DAY,
       updatedAt: now - 18 * MINUTE,
       position: { x: 0, y: 0 },
@@ -515,13 +821,15 @@ export function createSeedState(now: number = Date.now()): GraphState {
       strategy: 'priority-failover',
       members: [
         { accountId: 'acc_ant_4', weight: 1, priority: 1, enabled: true },
-        { accountId: 'acc_ant_3', weight: 1, priority: 2, enabled: true },
-        { accountId: 'acc_oai_2', weight: 1, priority: 3, enabled: true },
+        { accountId: 'acc_ant_5', weight: 1, priority: 2, enabled: true },
+        { accountId: 'acc_bed_1', weight: 1, priority: 3, enabled: true },
       ],
       stickySession: false,
       maxRetries: 2,
       maxConcurrency: 60,
-      failoverPoolId: null,
+      // Deliberate: this pool's members are too weak to serve, so this spill-over
+      // target is what the operator actually sees firing on the canvas.
+      failoverPoolId: 'pool_main',
       cursor: 0,
     },
     {
@@ -531,7 +839,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['gpt', 'round-robin'],
-      note: '轮询分配，三个账号均摊压力。',
+      note: '轮询分配，三个 OpenAI 账号均摊压力，其中一个走直连。',
       createdAt: now - 70 * DAY,
       updatedAt: now - 33 * MINUTE,
       position: { x: 0, y: 0 },
@@ -540,7 +848,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       members: [
         { accountId: 'acc_oai_1', weight: 1, priority: 1, enabled: true },
         { accountId: 'acc_oai_2', weight: 1, priority: 2, enabled: true },
-        { accountId: 'acc_gem_1', weight: 1, priority: 3, enabled: true },
+        { accountId: 'acc_oai_3', weight: 1, priority: 3, enabled: true },
       ],
       stickySession: false,
       maxRetries: 1,
@@ -555,7 +863,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['低成本', 'least-latency'],
-      note: 'DeepSeek 为主，海外低成本模型兜底，始终选延迟最低的成员。',
+      note: 'DeepSeek 为主、Gemini 兜底，始终选延迟最低的成员。',
       createdAt: now - 30 * DAY,
       updatedAt: now - 9 * MINUTE,
       position: { x: 0, y: 0 },
@@ -564,17 +872,13 @@ export function createSeedState(now: number = Date.now()): GraphState {
       members: [
         { accountId: 'acc_ds_1', weight: 3, priority: 1, enabled: true },
         { accountId: 'acc_gem_1', weight: 2, priority: 2, enabled: true },
-        { accountId: 'acc_bed_1', weight: 1, priority: 3, enabled: true },
       ],
       stickySession: false,
       maxRetries: 2,
       maxConcurrency: 40,
-      failoverPoolId: null,
+      failoverPoolId: 'pool_gpt',
       cursor: 0,
     },
-    // The remaining two documented strategies need a pool each, plus a key
-    // bound to them at priority 1 — a key always uses the first pool that is
-    // available, so a strategy nobody reaches first is never demonstrated.
     {
       id: 'pool_lab',
       kind: 'pool',
@@ -582,16 +886,15 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['实验', 'least-used'],
-      note: '按累计请求数均摊，用来长期拉平各账号的配额消耗。',
+      note: '按累计请求数均摊，用来长期拉平两个实验账号的配额消耗。',
       createdAt: now - 20 * DAY,
       updatedAt: now - 12 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
       strategy: 'least-used',
       members: [
-        { accountId: 'acc_oai_1', weight: 1, priority: 1, enabled: true },
-        { accountId: 'acc_gem_1', weight: 1, priority: 2, enabled: true },
-        { accountId: 'acc_ds_1', weight: 1, priority: 3, enabled: true },
+        { accountId: 'acc_gem_2', weight: 1, priority: 1, enabled: true },
+        { accountId: 'acc_azu_1', weight: 1, priority: 2, enabled: true },
       ],
       // Sticky pins expire after 20s, so this pool shows both behaviours.
       stickySession: true,
@@ -607,16 +910,15 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['影子', 'random'],
-      note: '完全随机命中，用来打散上游侧的会话亲和。',
+      note: '完全随机命中两个影子账号，用来打散上游侧的会话亲和。',
       createdAt: now - 14 * DAY,
       updatedAt: now - 21 * MINUTE,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
       strategy: 'random',
       members: [
-        { accountId: 'acc_ds_1', weight: 1, priority: 1, enabled: true },
-        { accountId: 'acc_bed_1', weight: 1, priority: 2, enabled: true },
-        { accountId: 'acc_gem_1', weight: 1, priority: 3, enabled: true },
+        { accountId: 'acc_ds_2', weight: 1, priority: 1, enabled: true },
+        { accountId: 'acc_bed_2', weight: 1, priority: 2, enabled: true },
       ],
       stickySession: false,
       maxRetries: 1,
@@ -627,6 +929,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
   ]
 
   /* ---------------------------------------------------------------- keys -- */
+  // Key <-> Pool stays MANY-TO-MANY: every key fans out to two pools and the
+  // four busy pools are each bound by three different keys.
 
   const keys: KeyEntity[] = [
     {
@@ -739,7 +1043,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['压测', '可随时停用'],
-      note: '容量压测专用，先打备用池，用来观察故障转移。',
+      note: '容量压测专用，先打备用池，用来观察故障转移到主力池的全过程。',
       createdAt: now - 5 * DAY,
       updatedAt: now - 90 * MINUTE,
       position: { x: 0, y: 0 },
@@ -764,7 +1068,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['实验', '低优先级'],
-      note: '离线评测脚本，走均摊池，让每个账号的配额消耗保持一致。',
+      note: '离线评测脚本，走均摊池，让两个实验账号的配额消耗保持一致。',
       createdAt: now - 20 * DAY,
       updatedAt: now - 55 * MINUTE,
       position: { x: 0, y: 0 },
@@ -789,7 +1093,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['影子', '可随时停用'],
-      note: '线上流量的镜像副本，随机打散到影子池，用来观察随机策略。',
+      note: '线上流量的镜像副本，随机打散到影子池，国产池兜底。',
       createdAt: now - 9 * DAY,
       updatedAt: now - 31 * MINUTE,
       position: { x: 0, y: 0 },
@@ -799,7 +1103,10 @@ export function createSeedState(now: number = Date.now()): GraphState {
       tier: 'pro',
       rateLimit: { rpm: 180, concurrency: 24 },
       quota: { limitTokens: 4_000_000, usedTokens: 640_000, resetAt },
-      bindings: [{ poolId: 'pool_shadow', priority: 1, weight: 1 }],
+      bindings: [
+        { poolId: 'pool_shadow', priority: 1, weight: 1 },
+        { poolId: 'pool_cn', priority: 2, weight: 1 },
+      ],
       allowedModels: [],
       trafficWeight: 1,
       expiresAt: now + 45 * DAY,

@@ -3,6 +3,12 @@
  *
  * Owns the whole `GraphState`, keeps an id index, derives entity health and
  * tracks a dirty set so the websocket layer can broadcast minimal patches.
+ *
+ * It is also the ONLY place that enforces the Pool -> Account cardinality (see
+ * the CARDINALITY block in `shared/src/types.ts`): `PoolEntity.members` is
+ * authoritative, an account appears in at most one pool's members, and
+ * `AccountEntity.poolId` is a derived back-reference recomputed by exactly one
+ * function — `syncAccountPoolRefs()` — after every mutating path.
  */
 import {
   LAYOUT,
@@ -46,6 +52,13 @@ export interface EntityRef {
   kind: EntityKind
   id: string
 }
+
+/** Operator-visible log line emitted by a store mutation. */
+export type StoreLogLevel = 'info' | 'warn' | 'error'
+export type StoreLogSink = (level: StoreLogLevel, message: string) => void
+
+/** Dev-only invariant checks; a broken invariant warns, it never throws. */
+const CHECK_INVARIANTS = process.env.NODE_ENV !== 'production'
 
 /* ------------------------------------------------------------- coercion -- */
 
@@ -112,12 +125,25 @@ export class GraphStore {
   private dirty = new Set<string>()
   /** Exponentially smoothed error rate per entity, used for `degraded`. */
   private recentError = new Map<string, number>()
+  /** Set by the HTTP layer so re-parenting is announced on the operator log. */
+  private logSink: StoreLogSink | null = null
 
   constructor(state: GraphState = createSeedState()) {
     this.state = state
     this.reindex()
+    this.syncAccountPoolRefs(Date.now())
+    this.syncKeyBindingRefs(Date.now())
     this.refreshStatuses()
     this.dirty.clear()
+  }
+
+  /** Route store-level operator messages to the websocket broadcast. */
+  setLogSink(sink: StoreLogSink | null): void {
+    this.logSink = sink
+  }
+
+  private log(level: StoreLogLevel, message: string): void {
+    this.logSink?.(level, message)
   }
 
   /* ------------------------------------------------------------ reading -- */
@@ -131,6 +157,8 @@ export class GraphStore {
     this.recentError.clear()
     this.dirty.clear()
     this.reindex()
+    this.syncAccountPoolRefs(Date.now())
+    this.syncKeyBindingRefs(Date.now())
     this.refreshStatuses()
     this.dirty.clear()
   }
@@ -291,6 +319,168 @@ export class GraphStore {
     }
   }
 
+  /* -------------------------------------------- pool -> account ownership -- */
+
+  /**
+   * Recompute every `account.poolId` from `pool.members` — THE ONLY writer of
+   * that field in the whole codebase.
+   *
+   * It also repairs the authoritative side defensively, so a hand-built state,
+   * a replayed snapshot or a future code path can never leave the graph in an
+   * illegal shape:
+   *   - a member row pointing at an unknown account is dropped;
+   *   - a duplicated accountId inside one pool collapses to a single row;
+   *   - an account listed by several pools is kept by the LAST pool in
+   *     `state.pools` order and removed from the earlier ones, with a warn log.
+   *
+   * Every mutating path that can touch membership calls this: create, update,
+   * remove, bind, unbind, replace/reset and the constructor (seed).
+   */
+  private syncAccountPoolRefs(now: number = Date.now()): void {
+    // 1. per-pool cleanup: dangling members and in-pool duplicates.
+    for (const pool of this.state.pools) {
+      const seen = new Set<string>()
+      const kept: PoolMember[] = []
+      for (const member of pool.members) {
+        if (seen.has(member.accountId)) continue
+        if (!this.getAccount(member.accountId)) continue
+        seen.add(member.accountId)
+        kept.push(member)
+      }
+      if (kept.length !== pool.members.length) {
+        pool.members = kept
+        pool.cursor = 0
+        pool.updatedAt = now
+        this.markDirty(pool)
+      }
+    }
+
+    // 2. cross-pool cleanup: at most one owner per account, last pool wins.
+    const owner = new Map<string, PoolEntity>()
+    for (const pool of this.state.pools) {
+      for (const member of pool.members) {
+        const previous = owner.get(member.accountId)
+        if (previous && previous !== pool) {
+          previous.members = previous.members.filter((row) => row.accountId !== member.accountId)
+          previous.cursor = 0
+          previous.updatedAt = now
+          this.markDirty(previous)
+          const account = this.getAccount(member.accountId)
+          this.log(
+            'warn',
+            `账号「${account?.name ?? member.accountId}」同时出现在多个池中，已从「${previous.name}」移除，仅保留在「${pool.name}」`,
+          )
+        }
+        owner.set(member.accountId, pool)
+      }
+    }
+
+    // 3. rewrite the derived back-reference.
+    for (const account of this.state.accounts) {
+      const next = owner.get(account.id)?.id ?? null
+      if (account.poolId !== next) {
+        account.poolId = next
+        account.updatedAt = now
+        this.markDirty(account)
+      }
+    }
+  }
+
+  /**
+   * Defensive repair pass for the Key <-> Pool relation — the sibling of
+   * `syncAccountPoolRefs`. `parseBindings` already collapses duplicate rows by
+   * poolId; this additionally drops any binding that points at a pool which no
+   * longer exists (or never did), so a key can never carry a dangling reference
+   * after a mutation — most importantly after a pool is removed.
+   *
+   * Called from every mutating path that can touch bindings or pools: create,
+   * update, remove, bind, unbind, replace/reset and the constructor (seed).
+   */
+  private syncKeyBindingRefs(now: number = Date.now()): void {
+    for (const key of this.state.keys) {
+      const seen = new Set<string>()
+      const kept: PoolBinding[] = []
+      for (const binding of key.bindings) {
+        if (seen.has(binding.poolId)) continue
+        if (!this.getPool(binding.poolId)) continue
+        seen.add(binding.poolId)
+        kept.push(binding)
+      }
+      if (kept.length !== key.bindings.length) {
+        key.bindings = kept
+        key.updatedAt = now
+        this.markDirty(key)
+      }
+    }
+  }
+
+  /**
+   * Make `pool` the sole owner of every account it now lists: steal them from
+   * whichever pool held them before. Used by the `members` patch, which is the
+   * one place a client can hand us a whole new member list.
+   */
+  private claimAccounts(pool: PoolEntity, now: number): void {
+    const claimed = new Set(pool.members.map((member) => member.accountId))
+    if (claimed.size === 0) return
+    for (const other of this.state.pools) {
+      if (other.id === pool.id) continue
+      const before = other.members.length
+      const stolen = other.members.filter((member) => claimed.has(member.accountId))
+      if (stolen.length === 0) continue
+      other.members = other.members.filter((member) => !claimed.has(member.accountId))
+      if (other.members.length === before) continue
+      other.cursor = 0
+      other.updatedAt = now
+      this.markDirty(other)
+      for (const member of stolen) {
+        const account = this.getAccount(member.accountId)
+        this.log(
+          'info',
+          `账号「${account?.name ?? member.accountId}」已从池「${other.name}」迁移到池「${pool.name}」`,
+        )
+      }
+    }
+  }
+
+  /**
+   * Cheap dev-time guard. Warns — never throws — when the one-pool-per-account
+   * invariant or its derived back-reference got out of sync after a mutation.
+   */
+  private assertPoolInvariant(context: string): void {
+    if (!CHECK_INVARIANTS) return
+    const owners = new Map<string, string[]>()
+    for (const pool of this.state.pools) {
+      for (const member of pool.members) {
+        const list = owners.get(member.accountId)
+        if (list) list.push(pool.id)
+        else owners.set(member.accountId, [pool.id])
+      }
+    }
+
+    for (const [accountId, list] of owners) {
+      if (list.length > 1) {
+        console.warn(
+          `[kpa] invariant broken after ${context}: account ${accountId} is owned by ${list.length} pools (${list.join(', ')})`,
+        )
+      }
+      if (!this.getAccount(accountId)) {
+        console.warn(
+          `[kpa] invariant broken after ${context}: pool(s) ${list.join(', ')} reference unknown account ${accountId}`,
+        )
+      }
+    }
+
+    for (const account of this.state.accounts) {
+      const list = owners.get(account.id) ?? []
+      const expected = list.length === 1 ? list[0] : null
+      if (list.length <= 1 && account.poolId !== expected) {
+        console.warn(
+          `[kpa] invariant broken after ${context}: account ${account.id} poolId=${String(account.poolId)} but pool.members say ${String(expected)}`,
+        )
+      }
+    }
+  }
+
   /* ---------------------------------------------------------- mutations -- */
 
   create(kind: EntityKind, draft: Record<string, unknown> = {}): Entity {
@@ -302,9 +492,15 @@ export class GraphStore {
     }
     this.listOf(kind).push(entity)
     this.index.set(entity.id, entity)
+    // A freshly created account is in no pool (poolId null); a pool created with
+    // a `members` draft must steal those accounts from their previous owners.
+    if (entity.kind === 'pool') this.claimAccounts(entity, now)
+    this.syncAccountPoolRefs(now)
+    this.syncKeyBindingRefs(now)
     this.state.updatedAt = now
     this.refreshStatuses(now)
     this.markDirty(entity)
+    this.assertPoolInvariant(`create(${kind})`)
     return entity
   }
 
@@ -314,10 +510,18 @@ export class GraphStore {
     if (entity.kind !== kind) throw new Error(`实体 ${id} 的类型是 ${entity.kind}，不是 ${kind}`)
     const now = Date.now()
     this.applyPatch(entity, patch, now)
+    // A `members` patch is a re-parenting operation: every account it now lists
+    // leaves whatever pool used to own it (Pool -> Account is one-to-many).
+    // Member rows are validated in `parseMembers` (weight/priority coerced) and
+    // rows pointing at an unknown account are dropped by `syncAccountPoolRefs`.
+    if (entity.kind === 'pool') this.claimAccounts(entity, now)
+    this.syncAccountPoolRefs(now)
+    this.syncKeyBindingRefs(now)
     entity.updatedAt = now
     this.state.updatedAt = now
     this.refreshStatuses(now)
     this.markDirty(entity)
+    this.assertPoolInvariant(`update(${kind})`)
     return entity
   }
 
@@ -332,15 +536,10 @@ export class GraphStore {
         this.state.keys = this.state.keys.filter((item) => item.id !== id)
         break
       case 'pool': {
+        // The pool's accounts are NOT deleted: they simply become unassigned
+        // (未分配). `syncAccountPoolRefs` below resets their poolId to null, and
+        // `syncKeyBindingRefs` drops every key binding that pointed at this pool.
         this.state.pools = this.state.pools.filter((item) => item.id !== id)
-        for (const key of this.state.keys) {
-          const before = key.bindings.length
-          key.bindings = key.bindings.filter((binding) => binding.poolId !== id)
-          if (key.bindings.length !== before) {
-            key.updatedAt = now
-            this.markDirty(key)
-          }
-        }
         for (const pool of this.state.pools) {
           if (pool.failoverPoolId === id) {
             pool.failoverPoolId = null
@@ -379,8 +578,11 @@ export class GraphStore {
     this.index.delete(id)
     this.dirty.delete(id)
     this.recentError.delete(id)
+    this.syncAccountPoolRefs(now)
+    this.syncKeyBindingRefs(now)
     this.state.updatedAt = now
     this.refreshStatuses(now)
+    this.assertPoolInvariant(`remove(${kind})`)
   }
 
   move(id: string, position: XY): Entity {
@@ -412,10 +614,34 @@ export class GraphStore {
       case 'pool-account': {
         const { pool, account } = relation
         if (pool.members.some((member) => member.accountId === account.id)) return
+
+        // Pool -> Account is ONE-TO-MANY: an account belongs to at most one
+        // pool, so binding an account that another pool already owns is a MOVE
+        // (re-parenting), never an error. Dragging an edge from a pool onto an
+        // already-owned account in the canvas therefore steals it — which is the
+        // desired UX, so it is announced on the operator log.
+        const previous = this.state.pools.find(
+          (other) =>
+            other.id !== pool.id && other.members.some((member) => member.accountId === account.id),
+        )
+        if (previous) {
+          previous.members = previous.members.filter((member) => member.accountId !== account.id)
+          previous.cursor = 0
+          previous.updatedAt = now
+          this.markDirty(previous)
+        }
+
         const nextPriority = pool.members.reduce((max, m) => Math.max(max, m.priority), 0) + 1
         pool.members.push({ accountId: account.id, weight: 1, priority: nextPriority, enabled: true })
         pool.updatedAt = now
         this.markDirty(pool)
+
+        if (previous) {
+          this.log(
+            'info',
+            `账号「${account.name}」已从池「${previous.name}」迁移到池「${pool.name}」（一个账号只能属于一个池）`,
+          )
+        }
         break
       }
       case 'account-proxy': {
@@ -428,8 +654,11 @@ export class GraphStore {
       }
     }
 
+    this.syncAccountPoolRefs(now)
+    this.syncKeyBindingRefs(now)
     this.state.updatedAt = now
     this.refreshStatuses(now)
+    this.assertPoolInvariant('bind')
   }
 
   unbind(source: EntityRef, target: EntityRef): void {
@@ -466,8 +695,13 @@ export class GraphStore {
       }
     }
 
+    // Unbinding pool -> account leaves the account unassigned (poolId null),
+    // which is a legal, meaningful state (未分配).
+    this.syncAccountPoolRefs(now)
+    this.syncKeyBindingRefs(now)
     this.state.updatedAt = now
     this.refreshStatuses(now)
+    this.assertPoolInvariant('unbind')
   }
 
   private resolveRelation(
@@ -609,6 +843,10 @@ export class GraphStore {
           ...base,
           kind: 'account',
           name: '新建账号',
+          // A new account starts in NO pool. It only gets an owner through
+          // bind() or a pool `members` patch, and `syncAccountPoolRefs` is the
+          // only writer of this field afterwards.
+          poolId: null,
           provider: 'anthropic',
           credentialType: 'api-key',
           credentialMask: `sk-ant-api03-****${maskedTail()}`,
@@ -742,6 +980,12 @@ export class GraphStore {
         break
       }
       case 'account': {
+        // `poolId` is DERIVED from PoolEntity.members and is deliberately NOT
+        // patchable: PATCH /api/entities/account ignores a client-supplied
+        // poolId. Membership only changes through bind/unbind or a pool
+        // `members` patch, and only `syncAccountPoolRefs` writes this field.
+        // Accepting it here would let a client desync the derived reference from
+        // the authoritative member lists.
         entity.provider = has('provider')
           ? toEnum<Provider>(patch.provider, PROVIDERS, entity.provider)
           : entity.provider
@@ -802,10 +1046,16 @@ export class GraphStore {
 function parseBindings(value: unknown, fallback: PoolBinding[]): PoolBinding[] {
   if (!Array.isArray(value)) return fallback
   const out: PoolBinding[] = []
+  // A key binds a given pool at most once: collapse duplicate rows by poolId,
+  // the Key -> Pool mirror of the per-pool member dedupe in `syncAccountPoolRefs`
+  // step 1. Dangling poolIds are dropped later by `syncKeyBindingRefs`.
+  const seen = new Set<string>()
   value.forEach((raw, index) => {
     if (!isRecord(raw)) return
     const poolId = toStr(raw.poolId, '')
     if (!poolId) return
+    if (seen.has(poolId)) return
+    seen.add(poolId)
     out.push({
       poolId,
       priority: Math.max(1, Math.round(toNum(raw.priority, index + 1))),
