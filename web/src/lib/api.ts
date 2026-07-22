@@ -8,6 +8,7 @@ import {
   type Entity,
   type EntityKind,
   type InjectResponse,
+  type MoveRequest,
   type RequestTrace,
   type SimConfig,
   type StateResponse,
@@ -84,6 +85,11 @@ export const api = {
 
   move(id: string, position: XY): Promise<Entity> {
     return post<Entity>(`/entities/${encodeURIComponent(id)}/move`, { id, position })
+  },
+
+  /** Persist a whole auto-layout in ONE request (feature 11). */
+  moveBatch(moves: MoveRequest[]): Promise<OkResponse> {
+    return post<OkResponse>('/entities/move-batch', { moves })
   },
 
   bind(source: EntityRef, target: EntityRef): Promise<OkResponse> {

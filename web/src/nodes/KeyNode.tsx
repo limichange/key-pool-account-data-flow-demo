@@ -60,7 +60,7 @@ export const KeyNode = memo(function KeyNode({ data, selected }: NodeProps<KpaNo
       selected={selected}
       dimmed={data.dimmed}
       traced={data.traced}
-      handles="out"
+      handles="in-out"
       icon={<KeyRound size={14} />}
       subtitle={<span className="kpa-node__mono">{entity.id}</span>}
       headline={`${Math.round(metrics.rpm)} RPM · ${Math.round(rate * 100)}%`}

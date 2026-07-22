@@ -90,7 +90,7 @@ pnpm build            # 构建前端产物
 │ TopBar   品牌 · 连接状态 · 全局指标 · 模拟器开关/注入/重置/参数                │ 48px
 ├───────────┬──────────────────────────────────────────────┬───────────────────┤
 │ Palette   │  FlowCanvas                                  │  Inspector        │
-│ 概览      │    key ▸ pool ▸ account ▸ proxy 四列有向图     │  选中实体的        │
+│ 概览      │    gateway ▸ key ▸ pool ▸ account ▸ proxy    │  选中实体的        │
 │ 筛选      │    节点脉冲 / 边上跑粒子 / 链路高亮            │  全部可编辑字段    │
 │ 状态图例  │                                              │  + 指标 + 备注     │
 │ 图例/新建 │                                              │  未选中时显示系统概览 │ 1fr
@@ -103,18 +103,39 @@ pnpm build            # 构建前端产物
 窗口 < 1280px 时左侧 Palette 收成 64px 图标栏；< 1024px 时 Inspector 变成覆盖在画布上的抽屉，
 选中节点时滑出、点击空白处（或右上角 ×）收起。
 
-### 四列分别是什么
+### 五列分别是什么
 
 | 列 | 颜色 | 实体 | 承担的职责 |
 | --- | --- | --- | --- |
-| Key | 琥珀 | `KeyEntity` | 客户端凭证。持有 RPM 限流、Token 配额、模型白名单、流量权重；通过 `bindings`（`priority` + `weight`）指向一个或多个池 |
+| Gateway | 白金 | `GatewayEntity` | **全局唯一入口（单例）**。所有请求由此进入；汇总卡片显示总 RPS、成功率、时间线面积图和各密钥流量占比。可设全局 RPM 上限（`0` = 不限），停用即全局 kill switch（所有请求返回 `gateway-disabled`）。不可创建、不可删除 |
+| Key | 琥珀 | `KeyEntity` | 客户端凭证。持有 RPM 限流（新建默认 **60 次/分钟**）、Token 配额、模型白名单、流量权重；通过 `bindings`（`priority` + `weight`）指向一个或多个池 |
 | Pool | 紫 | `PoolEntity` | 路由池。持有成员账号列表、路由策略、粘滞会话、最大重试次数、并发上限、备用池 `failoverPoolId` |
-| Account | 青 | `AccountEntity` | 上游账号。真正持有供应商凭证（Anthropic / OpenAI / Gemini / Bedrock / Azure / DeepSeek），有自己的限流、配额、健康度与熔断状态 |
-| Proxy | 翠绿 | `ProxyEntity` | 出口代理。决定落地 IP 与地区（HTTP / HTTPS / SOCKS5，住宅/机房/移动），可被多个账号复用 |
+| Account | 青 | `AccountEntity` | 上游账号。真正持有供应商凭证（Anthropic / OpenAI / Gemini / Bedrock / Azure / DeepSeek），有自己的限流、配额、健康度与熔断状态；带套餐分类 `accountType`（`k12` 教育版 / `plus` / `pro` / `prolite`），每档有一套限流/配额/模型预设，创建和切换档位时套用 |
+| Proxy | 翠绿 | `ProxyEntity` | 出口代理。卡片顶部显示国旗 + 国家 + **出口 IP**（上游供应商实际看到的落地地址，与下面的拨号端点 `host:port` 是两回事），可被多个账号复用 |
 
-边只允许从左往右建立：`key → pool`、`pool → account`、`account → proxy`。
+边只允许从左往右建立：`key → pool`、`pool → account`、`account → proxy`
+（`gateway → key` 的边是隐式的，每把密钥自动挂在网关下，不可手动编辑）。
 从节点右侧的把手拖到下一列节点左侧的把手即可绑定；选中一条边按 `Delete` / `Backspace` 即可解绑。
 池的 `failoverPoolId` 会额外画一条虚线（标签「故障转移」）。
+
+**每条边中点有一枚实时指标胶囊**：关系标签 + 近 24 秒微柱状图 + 累计请求数 + 成功率，
+悬停展开完整明细（请求/成功/失败/RPM/平均延迟/Token/最近使用）。缩放 ≥ 0.75 显示完整胶囊，
+0.45–0.75 只留柱状图，< 0.45 隐藏。数据由服务端按 `trace.edgeIds` 逐边归因，
+零流量的边也会显式显示「0 请求」。
+
+**边的颜色回答「这条链路通不通」**：两端节点都启用 → 绿色；任一端停用 → 灰色虚线（无粒子）。
+每张卡片头部都有启用开关。四种实体色退到胶囊柱状图、粒子和边框上。
+
+**节点操作**：双击标题就地改名（Enter 提交 / Esc 取消）；删除任何节点都会弹出确认窗，
+窗内列出**由真实图计算出的后果**（多少密钥解绑、多少账号变游离等）；
+「自动布局」按钮（画布右下角和顶栏各一个）用重心法排序减少连线交叉，一键整理全图。
+
+**游离节点**：池 / 账号 / 代理都可以暂时没有上游（虚线边框 +「未接入」徽章，左侧概览计数），
+不接收流量但保留全部配置；网关和密钥永远在链上。
+
+**两条服务端强制的顺序规则**：
+1. 账号必须先绑定代理才能加入池（`bind(pool, account)` 对无代理账号返回 400；删除代理会级联把使用它的账号移出所属池）；
+2. 停用一个代理会**自动停用**它背后仍在池内的账号（`autoDisabledBy` 记录因果，重新启用代理时只恢复被它牵连的账号，不会误开你手动停掉的），触发时服务端推送 `notice` 事件、前端弹窗告知。
 
 ### 四条基数约束（cardinality）
 
@@ -237,11 +258,12 @@ Vite dev server 会把这两个路径代理过去，所以前端始终用同源�
 
 | 方法 | 路径 | 请求体 | 响应 |
 | --- | --- | --- | --- |
-| `GET` | `/api/state` | — | `{ state, config, stats }` |
-| `POST` | `/api/entities/:kind` | `Partial<Entity>` | `201` + 新建的 `Entity` |
+| `GET` | `/api/state` | — | `{ state, config, stats, edges }`（`edges` 为全量逐边指标，零流量的边也在） |
+| `POST` | `/api/entities/:kind` | `Partial<Entity>` | `201` + 新建的 `Entity`（`gateway` 为单例，返回 400） |
 | `PATCH` | `/api/entities/:kind/:id` | `Partial<Entity>` | 更新后的 `Entity` |
-| `DELETE` | `/api/entities/:kind/:id` | — | `{ ok: true }`，同时解除全部关联 |
+| `DELETE` | `/api/entities/:kind/:id` | — | `{ ok: true }`，同时解除全部关联（`gateway` 不可删除，返回 400；删代理会级联把账号移出池） |
 | `POST` | `/api/entities/:id/move` | `{ position: { x, y } }` | `Entity` |
+| `POST` | `/api/entities/move-batch` | `{ moves: [{ id, position }] }` | `{ ok: true }`（自动布局一次性保存全图用） |
 | `POST` | `/api/bind` | `{ source: { kind, id }, target: { kind, id } }` | `{ ok: true }` |
 | `POST` | `/api/unbind` | 同上 | `{ ok: true }` |
 | `POST` | `/api/sim` | `Partial<SimConfig>` | 完整的 `SimConfig` |
@@ -249,7 +271,7 @@ Vite dev server 会把这两个路径代理过去，所以前端始终用同源�
 | `POST` | `/api/reset` | — | `{ state, config, stats }` |
 | `GET` | `/api/traces?limit=n` | — | `{ traces: RequestTrace[] }` |
 
-`:kind` 用单数：`key` / `pool` / `account` / `proxy`。PATCH 的字段是白名单过滤的，
+`:kind` 用单数：`gateway` / `key` / `pool` / `account` / `proxy`。PATCH 的字段是白名单过滤的，
 未知字段静默忽略，`rateLimit` / `quota` / `health` 走深合并，`failoverPoolId` 不允许指向自己。
 非法请求返回 `{ error: "中文说明" }`，进程不会因为坏输入退出。
 
@@ -273,13 +295,17 @@ curl -s -X PATCH http://127.0.0.1:8787/api/entities/pool/pool_main \
 
 ```ts
 type ServerEvent =
-  | { type: 'snapshot'; state: GraphState; config: SimConfig; stats: GlobalStats }
+  | { type: 'snapshot'; state: GraphState; config: SimConfig; stats: GlobalStats;
+      edges: EdgeMetrics[] }                        // 全量逐边指标，含零流量的边
   | { type: 'patch';    entities: Entity[] }        // 字段有变化的实体，4 次/秒
-  | { type: 'removed';  ids: string[] }
+  | { type: 'removed';  ids: string[]; edgeIds?: string[] }  // 实体和/或失效的边指标
+  | { type: 'edges';    edges: EdgeMetrics[] }      // 本 tick 有变化的边指标，≤4 次/秒
   | { type: 'trace';    trace: RequestTrace }       // 每 tick 最多 10 条（inject 必发）
   | { type: 'stats';    stats: GlobalStats }        // 每 tick 一次，4 次/秒
   | { type: 'config';   config: SimConfig }
   | { type: 'log';      level: 'info' | 'warn' | 'error'; message: string; at: number }
+  | { type: 'notice';   level; title; message; entityIds: string[]; at: number }
+      // 需要弹窗告知的事件（如代理停用级联），entityIds 渲染成可点击芯片
 ```
 
 前端把 trace 攒 100ms 批量入 store，因此边上的粒子和节点脉冲最多有一帧的延迟；

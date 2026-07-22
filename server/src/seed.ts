@@ -7,6 +7,9 @@
  * enough that its `failoverPoolId` actually fires — so failure paths light up
  * within a few seconds of watching the canvas.
  *
+ * The graph is rooted in the SINGLETON gateway (`gw_main`) — every key hangs
+ * off it, it ships enabled and unlimited so existing behaviour is unchanged.
+ *
  * CARDINALITY (see shared/src/types.ts): Pool -> Account is ONE-TO-MANY, so the
  * six pools each own their OWN accounts and no account is shared. The partition
  * is 3/3/3/2/2/2 plus exactly one deliberately unassigned account:
@@ -17,7 +20,12 @@
  *   pool_cn      least-latency      acc_ds_1   acc_gem_1
  *   pool_lab     least-used         acc_gem_2  acc_azu_1
  *   pool_shadow  random             acc_ds_2   acc_bed_2
- *   (none)                          acc_free_1                      <- 未分配
+ *   (none)                          acc_free_1                      <- 未接入
+ *
+ * EGRESS RULE (feature: egress-before-serve): EVERY pool member has a proxy —
+ * there is no 直连 account carrying traffic. The single proxy-less account is
+ * `acc_free_1`, which is deliberately parked (no proxy, no pool) to demo the
+ * 「未绑定代理 · 无法加入池」 flow.
  *
  * The `accounts` array below is written in exactly that order — owning pool
  * first (pools in `state.pools` order), unassigned last — because index order
@@ -27,37 +35,98 @@
  * no edge crossings. Keep the two orders in sync when editing.
  */
 import {
+  KIND_ORDER,
+  LAYOUT,
   createMetrics,
+  detachedEntities,
   layoutSlots,
   type AccountEntity,
+  type Entity,
   type EntityKind,
+  type GatewayEntity,
   type GraphState,
   type KeyEntity,
+  type KindCounts,
   type PoolEntity,
   type ProxyEntity,
-  type XY,
 } from '@kpa/shared'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
-interface Placeable {
-  kind: EntityKind
-  position: XY
-}
+/**
+ * Vertical clearance between the live graph and the detached parking area.
+ * Keep in sync with `DETACHED_GAP` in `web/src/lib/graph.ts` (autoLayout).
+ */
+const DETACHED_GAP = 120
 
-/** Drop every entity onto its canonical canvas slot (see `layoutSlots`). */
-function placeAll(groups: Placeable[][]): void {
-  const counts: Partial<Record<EntityKind, number>> = {}
-  for (const group of groups) {
-    if (group.length > 0) counts[group[0].kind] = group.length
+/**
+ * Drop every entity onto the SAME canonical grid the client's 自动布局
+ * produces: attached entities pack the band/lane grid using ATTACHED-ONLY
+ * counts, detached ones (feature 5) are parked below the live graph,
+ * x-aligned with their own band. Matching `autoLayout` exactly is what makes
+ * the first 自动布局 click on an untouched seed a true no-op — packing the
+ * detached account into the band here used to shift every band and regroup
+ * the account lanes on that first click.
+ */
+function placeState(state: GraphState): void {
+  const detachedIds = new Set(detachedEntities(state).map((entity) => entity.id))
+  const attached = <T extends Entity>(list: T[]): T[] =>
+    list.filter((item) => !detachedIds.has(item.id))
+
+  const groups: Record<EntityKind, Entity[]> = {
+    gateway: [state.gateway],
+    // The gateway and keys never detach (see `isDetached`).
+    key: state.keys,
+    pool: attached(state.pools),
+    account: attached(state.accounts),
+    proxy: attached(state.proxies),
+  }
+  const counts: KindCounts = {
+    gateway: groups.gateway.length,
+    key: groups.key.length,
+    pool: groups.pool.length,
+    account: groups.account.length,
+    proxy: groups.proxy.length,
   }
   const slots = layoutSlots(counts)
-  for (const group of groups) {
-    group.forEach((item, index) => {
-      const slot = slots[item.kind]?.[index]
+  for (const kind of KIND_ORDER) {
+    groups[kind].forEach((item, index) => {
+      const slot = slots[kind][index]
       if (slot) item.position = { x: slot.x, y: slot.y }
+    })
+  }
+
+  /* Detached parking — same rule as `autoLayout` (features 5 + 11). */
+  let bottom = LAYOUT.topY
+  for (const kind of KIND_ORDER) {
+    for (const slot of slots[kind]) bottom = Math.max(bottom, slot.y + LAYOUT.nodeHeight[kind])
+  }
+  // Probe with every count clamped to >= 1: a 0-count band and a 1-count band
+  // share the same width, so `probe[kind][0].x` is the band's base x even when
+  // every node of that band is parked.
+  const probe = layoutSlots({
+    gateway: Math.max(1, counts.gateway ?? 0),
+    key: Math.max(1, counts.key ?? 0),
+    pool: Math.max(1, counts.pool ?? 0),
+    account: Math.max(1, counts.account ?? 0),
+    proxy: Math.max(1, counts.proxy ?? 0),
+  })
+  const parkY = bottom + DETACHED_GAP
+  const detachable = [
+    { kind: 'pool' as const, list: state.pools },
+    { kind: 'account' as const, list: state.accounts },
+    { kind: 'proxy' as const, list: state.proxies },
+  ]
+  for (const { kind, list } of detachable) {
+    const lost = list.filter((entity) => detachedIds.has(entity.id))
+    const baseX = probe[kind][0]?.x ?? 0
+    lost.forEach((entity, index) => {
+      entity.position = {
+        x: baseX,
+        y: parkY + index * (LAYOUT.nodeHeight[kind] + LAYOUT.rowGap),
+      }
     })
   }
 }
@@ -65,9 +134,32 @@ function placeAll(groups: Placeable[][]): void {
 export function createSeedState(now: number = Date.now()): GraphState {
   const resetAt = now + 45 * MINUTE
 
+  /* ------------------------------------------------------------- gateway -- */
+  // The SINGLETON entry node. Unlimited and enabled by default so the seed
+  // behaves exactly as before the gateway existed; disabling it is the
+  // console-wide kill switch.
+
+  const gateway: GatewayEntity = {
+    id: 'gw_main',
+    kind: 'gateway',
+    name: 'API 网关入口',
+    enabled: true,
+    status: 'healthy',
+    tags: ['入口', '单例'],
+    note: '所有客户端请求的统一入口，也是全局流量的总读数。停用它会切断整个控制台的流量。',
+    createdAt: now - 200 * DAY,
+    updatedAt: now - 2 * HOUR,
+    position: { x: 0, y: 0 },
+    metrics: createMetrics(),
+    endpoint: 'https://gw.limi.dev/v1',
+    rateLimit: { rpm: 0, concurrency: 0 },
+    version: 'v2.4.1',
+  }
+
   /* ------------------------------------------------------------- proxies -- */
   // Account -> Proxy is MANY-TO-ONE, so every live proxy is shared by two or
-  // three accounts and two accounts run 直连 (no proxy at all).
+  // three accounts. `host`/`port` is the endpoint you DIAL; `ip`/`country` is
+  // the egress the upstream SEES — the two are deliberately different.
 
   const proxies: ProxyEntity[] = [
     {
@@ -87,6 +179,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
       port: 8443,
       region: 'us-west-2',
       countryCode: 'US',
+      ip: '64.181.202.17',
+      country: '美国',
       poolType: 'datacenter',
       maxConcurrency: 240,
       health: { latencyMs: 62, alive: true, packetLoss: 0.002, lastCheckAt: now - 12_000 },
@@ -100,7 +194,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['residential', '低风控'],
-      note: '住宅 IP，风控友好，但抖动较大；主号 B 与影子号共用。',
+      note: '住宅 IP，风控友好，但抖动较大；主号 B、OpenAI 备用号与影子号共用。',
       createdAt: now - 74 * DAY,
       updatedAt: now - 5 * HOUR,
       position: { x: 0, y: 0 },
@@ -110,6 +204,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
       port: 1080,
       region: 'us-east-1',
       countryCode: 'US',
+      ip: '73.92.140.226',
+      country: '美国',
       poolType: 'residential',
       maxConcurrency: 80,
       health: { latencyMs: 128, alive: true, packetLoss: 0.012, lastCheckAt: now - 20_000 },
@@ -133,6 +229,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
       port: 3128,
       region: 'eu-central-1',
       countryCode: 'DE',
+      ip: '185.72.246.34',
+      country: '德国',
       poolType: 'datacenter',
       maxConcurrency: 120,
       health: { latencyMs: 186, alive: true, packetLoss: 0.004, lastCheckAt: now - 8_000 },
@@ -156,6 +254,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
       port: 8443,
       region: 'eu-west-2',
       countryCode: 'GB',
+      ip: '77.68.114.90',
+      country: '英国',
       poolType: 'datacenter',
       maxConcurrency: 100,
       health: { latencyMs: 152, alive: true, packetLoss: 0.007, lastCheckAt: now - 18_000 },
@@ -179,6 +279,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
       port: 1080,
       region: 'ap-southeast-1',
       countryCode: 'SG',
+      ip: '129.126.201.58',
+      country: '新加坡',
       poolType: 'datacenter',
       maxConcurrency: 160,
       health: { latencyMs: 98, alive: true, packetLoss: 0.006, lastCheckAt: now - 15_000 },
@@ -202,6 +304,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
       port: 8080,
       region: 'ap-northeast-1',
       countryCode: 'JP',
+      ip: '126.209.16.73',
+      country: '日本',
       poolType: 'mobile',
       maxConcurrency: 40,
       health: { latencyMs: 164, alive: true, packetLoss: 0.035, lastCheckAt: now - 26_000 },
@@ -225,6 +329,8 @@ export function createSeedState(now: number = Date.now()): GraphState {
       port: 8443,
       region: 'ap-east-1',
       countryCode: 'HK',
+      ip: '103.10.60.42',
+      country: '中国香港',
       poolType: 'datacenter',
       maxConcurrency: 100,
       health: { latencyMs: 0, alive: false, packetLoss: 1, lastCheckAt: now - 6 * MINUTE },
@@ -255,10 +361,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_main',
       provider: 'anthropic',
+      accountType: 'pro',
       credentialType: 'api-key',
       credentialMask: 'sk-ant-api03-****f21a',
       region: 'us-west-2',
       proxyId: 'px_us_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 420, concurrency: 60 },
       quota: { limitTokens: 24_000_000, usedTokens: 6_820_000, resetAt },
       health: {
@@ -287,10 +395,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_main',
       provider: 'anthropic',
+      accountType: 'plus',
       credentialType: 'oauth',
       credentialMask: 'oauth-ant-****7be3',
       region: 'us-east-1',
       proxyId: 'px_us_2',
+      autoDisabledBy: null,
       rateLimit: { rpm: 300, concurrency: 40 },
       quota: { limitTokens: 16_000_000, usedTokens: 4_140_000, resetAt },
       health: {
@@ -320,10 +430,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_main',
       provider: 'anthropic',
+      accountType: 'k12',
       credentialType: 'session',
       credentialMask: 'sess-ant-eu-****0c4d',
       region: 'eu-central-1',
       proxyId: 'px_de_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 180, concurrency: 24 },
       quota: { limitTokens: 2_000_000, usedTokens: 1_880_000, resetAt: now + 12 * MINUTE },
       health: {
@@ -358,10 +470,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_backup',
       provider: 'anthropic',
+      accountType: 'prolite',
       credentialType: 'api-key',
       credentialMask: 'sk-ant-api03-****91d7',
       region: 'ap-southeast-1',
       proxyId: 'px_sg_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 120, concurrency: 16 },
       quota: { limitTokens: 8_000_000, usedTokens: 512_000, resetAt },
       health: {
@@ -391,10 +505,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_backup',
       provider: 'anthropic',
+      accountType: 'prolite',
       credentialType: 'api-key',
       credentialMask: 'sk-ant-api03-****5e8b',
       region: 'eu-west-2',
       proxyId: 'px_uk_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 90, concurrency: 12 },
       quota: { limitTokens: 1_500_000, usedTokens: 1_500_000, resetAt: now + 33 * MINUTE },
       health: {
@@ -423,10 +539,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_backup',
       provider: 'bedrock',
+      accountType: 'plus',
       credentialType: 'api-key',
       credentialMask: 'AKIA****QZ7X',
       region: 'ap-east-1',
       proxyId: 'px_hk_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 200, concurrency: 24 },
       quota: { limitTokens: 9_000_000, usedTokens: 1_880_000, resetAt },
       health: {
@@ -457,10 +575,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_gpt',
       provider: 'openai',
+      accountType: 'pro',
       credentialType: 'api-key',
       credentialMask: 'sk-proj-****3a09',
       region: 'us-east-1',
       proxyId: 'px_us_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 360, concurrency: 48 },
       quota: { limitTokens: 12_000_000, usedTokens: 3_310_000, resetAt },
       health: {
@@ -478,21 +598,23 @@ export function createSeedState(now: number = Date.now()): GraphState {
     {
       id: 'acc_oai_2',
       kind: 'account',
-      name: 'OpenAI 备用号（直连）',
+      name: 'OpenAI 备用号',
       enabled: true,
       status: 'healthy',
-      tags: ['备用', '直连'],
-      note: '不走代理，直接出网，用于对比链路延迟。',
+      tags: ['备用', 'gpt'],
+      note: '备用出口走美东住宅代理，用于对比主力链路的延迟与风控表现。',
       createdAt: now - 46 * DAY,
       updatedAt: now - 2 * HOUR,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
       poolId: 'pool_gpt',
       provider: 'openai',
+      accountType: 'plus',
       credentialType: 'api-key',
       credentialMask: 'sk-proj-****ce62',
       region: 'us-west-1',
-      proxyId: null,
+      proxyId: 'px_us_2',
+      autoDisabledBy: null,
       rateLimit: { rpm: 240, concurrency: 32 },
       quota: { limitTokens: 6_000_000, usedTokens: 1_020_000, resetAt },
       health: {
@@ -521,10 +643,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_gpt',
       provider: 'openai',
+      accountType: 'plus',
       credentialType: 'api-key',
       credentialMask: 'sk-proj-****7d41',
       region: 'eu-central-1',
       proxyId: 'px_de_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 200, concurrency: 24 },
       quota: { limitTokens: 7_000_000, usedTokens: 2_400_000, resetAt },
       health: {
@@ -555,10 +679,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_cn',
       provider: 'deepseek',
+      accountType: 'pro',
       credentialType: 'api-key',
       credentialMask: 'sk-ds-****b7a5',
       region: 'cn-north-1',
       proxyId: 'px_sg_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 150, concurrency: 20 },
       quota: { limitTokens: 20_000_000, usedTokens: 5_640_000, resetAt },
       health: {
@@ -587,10 +713,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_cn',
       provider: 'gemini',
+      accountType: 'plus',
       credentialType: 'oauth',
       credentialMask: 'gcp-sa-****4f18',
       region: 'asia-northeast1',
       proxyId: 'px_jp_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 240, concurrency: 32 },
       quota: { limitTokens: 10_000_000, usedTokens: 2_460_000, resetAt },
       health: {
@@ -621,10 +749,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_lab',
       provider: 'gemini',
+      accountType: 'prolite',
       credentialType: 'oauth',
       credentialMask: 'gcp-sa-****9a27',
       region: 'asia-northeast1',
       proxyId: 'px_jp_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 120, concurrency: 16 },
       quota: { limitTokens: 5_000_000, usedTokens: 860_000, resetAt },
       health: {
@@ -653,10 +783,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_lab',
       provider: 'azure',
+      accountType: 'k12',
       credentialType: 'api-key',
       credentialMask: 'azure-****13cf',
       region: 'uksouth',
       proxyId: 'px_uk_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 180, concurrency: 24 },
       quota: { limitTokens: 6_000_000, usedTokens: 1_440_000, resetAt },
       health: {
@@ -687,10 +819,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_shadow',
       provider: 'deepseek',
+      accountType: 'prolite',
       credentialType: 'api-key',
       credentialMask: 'sk-ds-****31e0',
       region: 'cn-north-1',
       proxyId: 'px_us_2',
+      autoDisabledBy: null,
       rateLimit: { rpm: 120, concurrency: 16 },
       quota: { limitTokens: 8_000_000, usedTokens: 1_200_000, resetAt },
       health: {
@@ -719,10 +853,12 @@ export function createSeedState(now: number = Date.now()): GraphState {
       metrics: createMetrics(),
       poolId: 'pool_shadow',
       provider: 'bedrock',
+      accountType: 'plus',
       credentialType: 'api-key',
       credentialMask: 'AKIA****4M2P',
       region: 'us-west-2',
       proxyId: 'px_us_1',
+      autoDisabledBy: null,
       rateLimit: { rpm: 160, concurrency: 20 },
       quota: { limitTokens: 6_000_000, usedTokens: 980_000, resetAt },
       health: {
@@ -738,28 +874,31 @@ export function createSeedState(now: number = Date.now()): GraphState {
       models: ['claude-sonnet-5'],
     },
 
-    /* -- unassigned · 未分配 ---------------------------------------------- */
+    /* -- unassigned · 未接入 ---------------------------------------------- */
     {
       // Demo state #4: a legal, meaningful zero — this account belongs to NO
-      // pool, so it receives no traffic at all until an operator drags a pool
-      // edge onto it. `poolId` must stay null and no pool may list it.
+      // pool AND has no proxy, so it receives no traffic at all. Per the
+      // egress-before-serve rule it cannot join a pool until an operator binds
+      // it to a proxy first; this is the seed's showcase of that flow.
       id: 'acc_free_1',
       kind: 'account',
       name: 'Anthropic 新采购号',
       enabled: true,
       status: 'healthy',
-      tags: ['未分配', '待接入'],
-      note: '本周新采购、尚未加入任何池，当前不接收任何流量。拖一条池的连线到它即可接入。',
+      tags: ['未接入', '未绑定代理'],
+      note: '本周新采购、尚未绑定出口代理，也未加入任何池，当前不接收任何流量。先绑定代理，再加入池即可接入。',
       createdAt: now - 2 * DAY,
       updatedAt: now - 2 * DAY,
       position: { x: 0, y: 0 },
       metrics: createMetrics(),
       poolId: null,
       provider: 'anthropic',
+      accountType: 'pro',
       credentialType: 'api-key',
       credentialMask: 'sk-ant-api03-****a604',
       region: 'us-west-2',
       proxyId: null,
+      autoDisabledBy: null,
       rateLimit: { rpm: 300, concurrency: 40 },
       quota: { limitTokens: 12_000_000, usedTokens: 0, resetAt },
       health: {
@@ -839,7 +978,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
       enabled: true,
       status: 'healthy',
       tags: ['gpt', 'round-robin'],
-      note: '轮询分配，三个 OpenAI 账号均摊压力，其中一个走直连。',
+      note: '轮询分配，三个 OpenAI 账号均摊压力，分别经美西、美东与法兰克福出口出网。',
       createdAt: now - 70 * DAY,
       updatedAt: now - 33 * MINUTE,
       position: { x: 0, y: 0 },
@@ -1113,7 +1252,7 @@ export function createSeedState(now: number = Date.now()): GraphState {
     },
   ]
 
-  placeAll([keys, pools, accounts, proxies])
-
-  return { keys, pools, accounts, proxies, updatedAt: now }
+  const state: GraphState = { gateway, keys, pools, accounts, proxies, updatedAt: now }
+  placeState(state)
+  return state
 }

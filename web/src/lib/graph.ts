@@ -1,23 +1,23 @@
 /**
- * Maps the domain `GraphState` onto React Flow nodes and edges,
- * plus a dagre based auto-layout helper.
+ * Maps the domain `GraphState` onto React Flow nodes and edges, plus the
+ * band/lane auto-layout with barycentre crossing reduction (feature 11).
  */
-import dagre from '@dagrejs/dagre'
 import type { Edge, Node } from '@xyflow/react'
 
 import {
   ENTITY_KINDS,
   KIND_ORDER,
   LAYOUT,
-  allEntities,
+  detachedEntities,
   edgeId,
-  kindCounts,
   layoutSlots,
   type AccountEntity,
   type Entity,
   type EntityKind,
+  type GatewayEntity,
   type GraphState,
   type KeyEntity,
+  type KindCounts,
   type PoolEntity,
   type ProxyEntity,
   type XY,
@@ -27,6 +27,12 @@ export interface FlowNodeData extends Record<string, unknown> {
   entity: Entity
   dimmed: boolean
   traced: boolean
+  /**
+   * Feature 5 — no upstream relation at all (游离 / 未接入). Orthogonal to
+   * `status`: a detached-but-healthy pool is still "healthy", it simply
+   * receives no traffic. Cards render the dashed treatment from this flag.
+   */
+  detached: boolean
 }
 
 export type KpaNode = Node<FlowNodeData, EntityKind>
@@ -35,8 +41,10 @@ export type KpaNode = Node<FlowNodeData, EntityKind>
  * `pool-failover` is a pool -> pool edge and is NOT a binding: it is the
  * `failoverPoolId` field. It needs its own relation so deleting it patches the
  * field instead of posting an `unbind` the server must reject.
+ * `gateway-key` is system-owned and implicit (every key hangs off the
+ * gateway): it can never be created, deleted or edited by the operator.
  */
-export type FlowEdgeKind = 'key-pool' | 'pool-account' | 'account-proxy' | 'pool-failover'
+export type FlowEdgeKind = 'gateway-key' | 'key-pool' | 'pool-account' | 'account-proxy' | 'pool-failover'
 
 export interface FlowEdgeData extends Record<string, unknown> {
   relation: FlowEdgeKind
@@ -44,6 +52,17 @@ export interface FlowEdgeData extends Record<string, unknown> {
   label: string
   weight: number
   disabled: boolean
+  /**
+   * Feature 4 — the edge STROKE now answers exactly one question: is this
+   * path live? GREEN (--ok) when BOTH endpoints are enabled, GREY when either
+   * is off. The owner asked for "node on -> its upstream line is green, node
+   * off -> grey"; the rule is deliberately extended to the source side too,
+   * because a live-green line dangling off a visibly disabled source card
+   * would read as a bug. Kind identity moved out of the stroke and into the
+   * chip (micro-bar colour, chip border) and the traffic particles.
+   * Precomputed here so `FlowEdge` stays a cheap primitive-only consumer.
+   */
+  live: boolean
   dimmed: boolean
   traced: boolean
 }
@@ -66,18 +85,24 @@ export interface BuildGraphOptions {
   tracedEdgeIds: Set<string>
 }
 
-const KIND_INDEX: Record<EntityKind, number> = {
-  key: KIND_ORDER.indexOf('key'),
-  pool: KIND_ORDER.indexOf('pool'),
-  account: KIND_ORDER.indexOf('account'),
-  proxy: KIND_ORDER.indexOf('proxy'),
-}
+const KIND_INDEX = KIND_ORDER.reduce(
+  (acc, kind, index) => {
+    acc[kind] = index
+    return acc
+  },
+  {} as Record<EntityKind, number>,
+)
 
 /* ----------------------------------------------------------- filtering -- */
 
 function searchCorpus(entity: Entity): string {
   const parts: string[] = [entity.id, entity.name, entity.note, ...entity.tags]
   switch (entity.kind) {
+    case 'gateway': {
+      const gateway = entity as GatewayEntity
+      parts.push(gateway.endpoint, gateway.version)
+      break
+    }
     case 'key': {
       const key = entity as KeyEntity
       parts.push(key.secret, key.owner, key.tier, ...key.allowedModels)
@@ -92,6 +117,7 @@ function searchCorpus(entity: Entity): string {
       const account = entity as AccountEntity
       parts.push(
         account.provider,
+        account.accountType,
         account.credentialMask,
         account.region,
         account.credentialType,
@@ -101,7 +127,15 @@ function searchCorpus(entity: Entity): string {
     }
     case 'proxy': {
       const proxy = entity as ProxyEntity
-      parts.push(proxy.host, `${proxy.host}:${proxy.port}`, proxy.region, proxy.countryCode, proxy.protocol)
+      parts.push(
+        proxy.host,
+        `${proxy.host}:${proxy.port}`,
+        proxy.ip,
+        proxy.country,
+        proxy.region,
+        proxy.countryCode,
+        proxy.protocol,
+      )
       break
     }
   }
@@ -114,6 +148,9 @@ function searchCorpus(entity: Entity): string {
  * keeps the topology intact and dims what does not match.
  */
 function keeps(entity: Entity, opts: BuildGraphOptions): boolean {
+  // The gateway is the singleton root of the whole graph: filtering it away
+  // would orphan the key band, so the chips and 只看异常 never remove it.
+  if (entity.kind === 'gateway') return true
   if (!opts.kindFilter[entity.kind]) return false
   if (opts.onlyProblems && entity.status === 'healthy') return false
   return true
@@ -137,14 +174,26 @@ export function buildGraph(state: GraphState, opts: BuildGraphOptions): BuiltGra
   const needle = opts.search.trim().toLowerCase()
   const filtered = opts.onlyProblems || ENTITY_KINDS.some((kind) => !opts.kindFilter[kind])
 
-  const all = allEntities(state)
-  const total: Record<EntityKind, number> = { key: 0, pool: 0, account: 0, proxy: 0 }
+  // `state.gateway.id === ''` is the pre-snapshot placeholder — skip it.
+  const hasGateway = Boolean(state.gateway?.id)
+  const all: Entity[] = [...state.keys, ...state.pools, ...state.accounts, ...state.proxies]
+  if (hasGateway) all.unshift(state.gateway)
+
+  const zeroCounts = (): Record<EntityKind, number> => ({
+    gateway: 0,
+    key: 0,
+    pool: 0,
+    account: 0,
+    proxy: 0,
+  })
+  const total = zeroCounts()
   for (const entity of all) total[entity.kind] += 1
 
   const entities = filtered ? all.filter((entity) => keeps(entity, opts)) : all
-  const visible: Record<EntityKind, number> = { key: 0, pool: 0, account: 0, proxy: 0 }
+  const visible = zeroCounts()
   const dimmedIds = new Set<string>()
   const known = new Map<string, Entity>()
+  const detachedIds = new Set(detachedEntities(state).map((entity) => entity.id))
   let searchMatches = 0
 
   for (const entity of entities) {
@@ -161,10 +210,13 @@ export function buildGraph(state: GraphState, opts: BuildGraphOptions): BuiltGra
     position: { x: entity.position.x, y: entity.position.y },
     draggable: true,
     selectable: true,
+    // The gateway singleton can never be deleted (feature 1/6).
+    deletable: entity.kind !== 'gateway',
     data: {
       entity,
       dimmed: dimmedIds.has(entity.id),
       traced: opts.tracedIds.has(entity.id),
+      detached: detachedIds.has(entity.id),
     },
   }))
 
@@ -175,8 +227,9 @@ export function buildGraph(state: GraphState, opts: BuildGraphOptions): BuiltGra
   // guard every edge id here — a duplicate key throws inside @xyflow's renderer.
   const emittedEdgeIds = new Set<string>()
 
-  const pushEdge = (source: Entity, targetId: string, data: EdgeSpec): void => {
-    if (!known.has(targetId)) return
+  const pushEdge = (source: Entity, targetId: string, spec: EdgeSpec): void => {
+    const target = known.get(targetId)
+    if (!target) return
     const id = edgeId(source.id, targetId)
     if (emittedEdgeIds.has(id)) return
     emittedEdgeIds.add(id)
@@ -187,13 +240,30 @@ export function buildGraph(state: GraphState, opts: BuildGraphOptions): BuiltGra
       sourceHandle: 'out',
       targetHandle: 'in',
       type: 'flow',
+      // The implicit gateway->key edges are system-owned, never user-deletable.
+      deletable: spec.relation !== 'gateway-key',
       data: {
-        ...data,
+        ...spec,
         sourceKind: source.kind,
+        live: source.enabled && target.enabled,
         dimmed: dimmedIds.has(source.id) || dimmedIds.has(targetId),
         traced: opts.tracedEdgeIds.has(id),
       },
     })
+  }
+
+  // Every key hangs off the gateway; these edges show each key's SHARE of the
+  // total traffic entering the console (feature 1).
+  if (hasGateway) {
+    for (const key of state.keys) {
+      if (!known.has(key.id)) continue
+      pushEdge(state.gateway, key.id, {
+        relation: 'gateway-key',
+        label: '入口',
+        weight: key.trafficWeight,
+        disabled: false,
+      })
+    }
   }
 
   for (const key of known.values()) {
@@ -300,127 +370,343 @@ export function buildGraph(state: GraphState, opts: BuildGraphOptions): BuiltGra
 
 /* -------------------------------------------------------------- layout -- */
 
-function buckets(state: GraphState): Record<EntityKind, Entity[]> {
-  return {
-    key: state.keys,
+/** Vertical clearance between the live graph and the detached parking area. */
+const DETACHED_GAP = 120
+
+/** Kinds that may legally detach (feature 5); the gateway and keys never do. */
+const DETACHABLE = ['pool', 'account', 'proxy'] as const
+
+/**
+ * Stable "where is it now" order. `layoutSlots` fills a band LANE-MAJOR (lane
+ * = x, then row = y), so recovering the current order must read x first —
+ * sorting y-first would interleave the lanes of a wrapped band and scramble a
+ * graph that was already tidy.
+ */
+function byCanvasOrder(a: Entity, b: Entity): number {
+  return a.position.x - b.position.x || a.position.y - b.position.y || a.id.localeCompare(b.id)
+}
+
+/** The four attached band orders one layout candidate is made of. */
+interface BandOrders {
+  keys: KeyEntity[]
+  pools: PoolEntity[]
+  accounts: AccountEntity[]
+  proxies: ProxyEntity[]
+}
+
+/**
+ * Re-packs the whole graph onto the canonical band/lane grid:
+ *
+ *   1. five bands left to right — gateway (singleton, vertically centred by
+ *      `layoutSlots`), keys, pools, accounts, proxies;
+ *   2. band ORDER starts from the current canvas order, then a couple of
+ *      barycentre crossing-reduction sweeps propose refinements (pools near
+ *      the keys that share them, keys near their pools, proxies at the mean
+ *      position of the accounts dialling them). Every candidate — including
+ *      the INCOMING free-form layout itself — is EVALUATED with
+ *      `countEdgeCrossings`; the repack wins ties against the current
+ *      positions (the tidy grid has value beyond crossings) but anything
+ *      strictly worse than what the operator already has is rejected, so the
+ *      result can never be worse than the incoming layout and 自动布局 on an
+ *      untouched seed graph is a no-op. The account band is always regrouped
+ *      into one contiguous block per owning pool — that structural rule is
+ *      what keeps the pool->account forest crossing-free;
+ *   3. detached pools/accounts/proxies (feature 5) are parked in a clearly
+ *      separated area BELOW the live graph, x-aligned with their own band, so
+ *      they never tangle the live topology.
+ *
+ * Coordinates come from `layoutSlots` — the same helper the seed data and the
+ * server-side placement of new entities use — which owns lane wrapping
+ * (`LAYOUT.maxRowsPerLane`), band centring and the overall aspect ratio
+ * window. This file only decides *order*.
+ */
+export function autoLayout(state: GraphState): Record<string, XY> {
+  const hasGateway = Boolean(state.gateway?.id)
+  const detachedIds = new Set(detachedEntities(state).map((entity) => entity.id))
+  const accountById = new Map(state.accounts.map((account) => [account.id, account]))
+
+  /* ---------------------------------------------- structural account rule -- */
+
+  // One CONTIGUOUS block per owning pool, pools in band order, members in
+  // routing order. Accounts owned by a *detached* pool are still attached
+  // (they have a pool), so they stay in the band, after the live blocks; an
+  // attached account no member row names (momentarily inconsistent snapshot)
+  // is stable-appended rather than lost.
+  const groupAccounts = (poolOrder: PoolEntity[]): AccountEntity[] => {
+    const ordered: AccountEntity[] = []
+    const placed = new Set<string>()
+    const claim = (pool: PoolEntity): void => {
+      for (const member of pool.members) {
+        const account = accountById.get(member.accountId)
+        if (!account || placed.has(account.id) || detachedIds.has(account.id)) continue
+        placed.add(account.id)
+        ordered.push(account)
+      }
+    }
+    for (const pool of poolOrder) claim(pool)
+    for (const pool of state.pools) {
+      if (detachedIds.has(pool.id)) claim(pool)
+    }
+    for (const account of state.accounts) {
+      if (placed.has(account.id) || detachedIds.has(account.id)) continue
+      placed.add(account.id)
+      ordered.push(account)
+    }
+    return ordered
+  }
+
+  const basePools = state.pools.filter((pool) => !detachedIds.has(pool.id)).sort(byCanvasOrder)
+  const base: BandOrders = {
+    keys: state.keys.slice().sort(byCanvasOrder),
+    pools: basePools,
+    accounts: groupAccounts(basePools),
+    proxies: state.proxies.filter((proxy) => !detachedIds.has(proxy.id)).sort(byCanvasOrder),
+  }
+
+  /* --------------------------------------------------------- geometry -- */
+
+  const counts: KindCounts = {
+    gateway: hasGateway ? 1 : 0,
+    key: base.keys.length,
+    pool: base.pools.length,
+    account: base.accounts.length,
+    proxy: base.proxies.length,
+  }
+  const slots = layoutSlots(counts)
+
+  // Centre-y of the i-th slot of a band — the coordinate the crossing counter
+  // actually measures. Index-based barycentres go wrong the moment a band
+  // wraps into lanes (index order is lane-major, not top-to-bottom); slot-y
+  // ones do not.
+  const slotY = (kind: EntityKind, index: number): number =>
+    (slots[kind][index]?.y ?? 0) + LAYOUT.nodeHeight[kind] / 2
+
+  /* --------------------------------- detached parking (features 5 + 11) -- */
+
+  let bottom = LAYOUT.topY
+  for (const kind of KIND_ORDER) {
+    for (const slot of slots[kind]) bottom = Math.max(bottom, slot.y + LAYOUT.nodeHeight[kind])
+  }
+  // Probe with every count clamped to >= 1: `layoutSlots` gives a 0-count band
+  // and a 1-count band the same width (both are one lane), so `slots[kind][0].x`
+  // is the band's base x even when every node of that band is parked.
+  const probe = layoutSlots({
+    gateway: Math.max(1, counts.gateway ?? 0),
+    key: Math.max(1, counts.key ?? 0),
+    pool: Math.max(1, counts.pool ?? 0),
+    account: Math.max(1, counts.account ?? 0),
+    proxy: Math.max(1, counts.proxy ?? 0),
+  })
+  const parkY = bottom + DETACHED_GAP
+  const parked: Record<string, XY> = {}
+  const listsByKind: Record<(typeof DETACHABLE)[number], Entity[]> = {
     pool: state.pools,
     account: state.accounts,
     proxy: state.proxies,
   }
-}
+  for (const kind of DETACHABLE) {
+    const lost = listsByKind[kind].filter((entity) => detachedIds.has(entity.id)).sort(byCanvasOrder)
+    const baseX = probe[kind][0]?.x ?? 0
+    lost.forEach((entity, index) => {
+      parked[entity.id] = {
+        x: baseX,
+        y: parkY + index * (LAYOUT.nodeHeight[kind] + LAYOUT.rowGap),
+      }
+    })
+  }
 
-/**
- * Ranks the entities of every kind so that connected nodes end up close to each
- * other, which is the only thing dagre is used for here: the actual coordinates
- * come from `layoutSlots`, so the four bands stay aligned with the seed data
- * and cards can never overlap. Returns `null` when dagre cannot rank the graph.
- */
-function dagreOrder(state: GraphState): Map<string, number> | null {
-  try {
-    const entities = allEntities(state)
-    const graph = new dagre.graphlib.Graph({ multigraph: true })
-    graph.setGraph({ rankdir: 'LR', ranksep: 200, nodesep: LAYOUT.rowGap, marginx: 0, marginy: 0 })
-    graph.setDefaultEdgeLabel(() => ({}))
-
-    const ids = new Set(entities.map((entity) => entity.id))
-    for (const entity of entities) {
-      graph.setNode(entity.id, {
-        width: LAYOUT.nodeWidth[entity.kind],
-        height: LAYOUT.nodeHeight[entity.kind],
+  const positionsFor = (orders: BandOrders): Record<string, XY> => {
+    const out: Record<string, XY> = {}
+    const assign = (kind: EntityKind, ordered: Entity[]): void => {
+      ordered.forEach((entity, index) => {
+        const slot = slots[kind][index]
+        if (slot) out[entity.id] = { x: slot.x, y: slot.y }
       })
     }
-
-    let edgeCount = 0
-    const link = (source: string, target: string): void => {
-      if (!ids.has(target) || source === target) return
-      graph.setEdge(source, target, {}, `e${edgeCount}`)
-      edgeCount += 1
-    }
-    for (const key of state.keys) for (const binding of key.bindings) link(key.id, binding.poolId)
-    for (const pool of state.pools) {
-      for (const member of pool.members) link(pool.id, member.accountId)
-      if (pool.failoverPoolId) link(pool.id, pool.failoverPoolId)
-    }
-    for (const account of state.accounts) {
-      if (account.proxyId) link(account.id, account.proxyId)
-    }
-
-    dagre.layout(graph)
-
-    const ranks = new Map<string, number>()
-    for (const entity of entities) {
-      const node = graph.node(entity.id)
-      if (!node || !Number.isFinite(node.y)) return null
-      ranks.set(entity.id, node.y)
-    }
-    return ranks
-  } catch {
-    return null
+    if (hasGateway) assign('gateway', [state.gateway])
+    assign('key', orders.keys)
+    assign('pool', orders.pools)
+    assign('account', orders.accounts)
+    assign('proxy', orders.proxies)
+    // Parked nodes are part of every candidate, so their (long) edges are
+    // measured by the evaluator too.
+    Object.assign(out, parked)
+    return out
   }
+
+  /* ------------------------------- barycentre sweeps, evaluation-gated -- */
+
+  // Reverse adjacency of Key <-> Pool, for the pool band's barycentres.
+  const keysOfPool = new Map<string, string[]>()
+  for (const key of state.keys) {
+    for (const binding of key.bindings) {
+      const list = keysOfPool.get(binding.poolId)
+      if (list) list.push(key.id)
+      else keysOfPool.set(binding.poolId, [key.id])
+    }
+  }
+
+  // Nodes with no neighbours keep their current slot-y (stable sort keeps
+  // exact ties in their current relative order).
+  const orderByBarycentre = <T extends Entity>(
+    list: T[],
+    kind: EntityKind,
+    neighbourYs: (entity: T) => number[],
+  ): T[] =>
+    list
+      .map((entity, index) => {
+        const ns = neighbourYs(entity)
+        const centre =
+          ns.length > 0 ? ns.reduce((sum, value) => sum + value, 0) / ns.length : slotY(kind, index)
+        return { entity, centre }
+      })
+      .sort((a, b) => a.centre - b.centre)
+      .map((item) => item.entity)
+
+  const sweep = (orders: BandOrders): BandOrders => {
+    const keyY = new Map(orders.keys.map((entity, index) => [entity.id, slotY('key', index)]))
+    const pools = orderByBarycentre(orders.pools, 'pool', (pool) =>
+      (keysOfPool.get(pool.id) ?? [])
+        .map((id) => keyY.get(id))
+        .filter((value): value is number => value !== undefined),
+    )
+    const poolY = new Map(pools.map((entity, index) => [entity.id, slotY('pool', index)]))
+    const keys = orderByBarycentre(orders.keys, 'key', (key) =>
+      key.bindings
+        .map((binding) => poolY.get(binding.poolId))
+        .filter((value): value is number => value !== undefined),
+    )
+    const accounts = groupAccounts(pools)
+    const accountY = new Map<string, number[]>()
+    accounts.forEach((account, index) => {
+      if (!account.proxyId) return
+      const list = accountY.get(account.proxyId)
+      if (list) list.push(slotY('account', index))
+      else accountY.set(account.proxyId, [slotY('account', index)])
+    })
+    const proxies = orderByBarycentre(orders.proxies, 'proxy', (proxy) => accountY.get(proxy.id) ?? [])
+    return { keys, pools, accounts, proxies }
+  }
+
+  /*
+   * The INCOMING free-form layout is a candidate too: hand-placed positions
+   * are scored first, so the repack can never leave the canvas with MORE
+   * crossings than the operator had. Detached parking is unconditional (it is
+   * feature 5's contract), so the current candidate carries the parked
+   * coordinates as well — even a "keep everything" outcome still parks.
+   */
+  const currentCandidate: Record<string, XY> = {}
+  for (const entity of [
+    ...(hasGateway ? [state.gateway] : []),
+    ...state.keys,
+    ...state.pools,
+    ...state.accounts,
+    ...state.proxies,
+  ]) {
+    currentCandidate[entity.id] = { x: entity.position.x, y: entity.position.y }
+  }
+  Object.assign(currentCandidate, parked)
+
+  let bestPositions = currentCandidate
+  let bestScore = countEdgeCrossings(state, currentCandidate)
+
+  // The canonical repack wins TIES against the free-form layout — the tidy
+  // band/lane grid has value beyond crossings — but a strictly worse repack is
+  // rejected, keeping the "never worse than the incoming layout" guarantee.
+  // On an untouched seed the repack equals the current positions, so the tie
+  // rule keeps 自动布局 a no-op there.
+  const baseCandidate = positionsFor(base)
+  const baseScore = countEdgeCrossings(state, baseCandidate)
+  if (baseScore <= bestScore) {
+    bestScore = baseScore
+    bestPositions = baseCandidate
+  }
+
+  let current = base
+  for (let pass = 0; pass < 2; pass += 1) {
+    current = sweep(current)
+    const candidate = positionsFor(current)
+    const score = countEdgeCrossings(state, candidate)
+    // Strictly better only: an equal-score shuffle would break the
+    // untouched-graph no-op guarantee for nothing.
+    if (score < bestScore) {
+      bestScore = score
+      bestPositions = candidate
+    }
+  }
+
+  return bestPositions
+}
+
+/* --------------------------------------------------- crossing counting -- */
+
+interface CrossSeg {
+  source: string
+  target: string
+  sy: number
+  ty: number
 }
 
 /**
- * Index of the pool that owns each account, for grouping the account band.
- *
- * Accounts with no pool sort after every pool (`state.pools.length`), which is
- * what puts 未分配 accounts at the bottom of the band. The derived
- * `account.poolId` back-reference is preferred; `PoolEntity.members` — the
- * source of truth — fills in anything it does not resolve.
+ * Counts pairs of same-channel edges whose endpoint order inverts between the
+ * two bands — the standard proxy for visual edge crossings in a layered
+ * layout. Pass `positions` to evaluate a candidate layout without applying it.
+ * Used to verify that `autoLayout` actually reduces crossings.
  */
-function poolRankOf(state: GraphState): Map<string, number> {
-  const poolIndex = new Map(state.pools.map((pool, index) => [pool.id, index]))
-  const rank = new Map<string, number>()
+export function countEdgeCrossings(state: GraphState, positions?: Record<string, XY>): number {
+  const entities = new Map<string, Entity>()
+  for (const entity of [
+    ...(state.gateway?.id ? [state.gateway] : []),
+    ...state.keys,
+    ...state.pools,
+    ...state.accounts,
+    ...state.proxies,
+  ]) {
+    entities.set(entity.id, entity)
+  }
+
+  const centreY = (id: string): number | null => {
+    const entity = entities.get(id)
+    if (!entity) return null
+    const y = positions?.[entity.id]?.y ?? entity.position.y
+    return y + LAYOUT.nodeHeight[entity.kind] / 2
+  }
+
+  const channels = new Map<string, CrossSeg[]>()
+  const add = (channel: string, source: string, target: string): void => {
+    const sy = centreY(source)
+    const ty = centreY(target)
+    if (sy === null || ty === null) return
+    const list = channels.get(channel)
+    const seg = { source, target, sy, ty }
+    if (list) list.push(seg)
+    else channels.set(channel, [seg])
+  }
+
+  if (state.gateway?.id) {
+    for (const key of state.keys) add('gateway-key', state.gateway.id, key.id)
+  }
+  for (const key of state.keys) {
+    for (const binding of key.bindings) add('key-pool', key.id, binding.poolId)
+  }
+  for (const pool of state.pools) {
+    for (const member of pool.members) add('pool-account', pool.id, member.accountId)
+  }
   for (const account of state.accounts) {
-    const index = account.poolId ? poolIndex.get(account.poolId) : undefined
-    if (index !== undefined) rank.set(account.id, index)
+    if (account.proxyId) add('account-proxy', account.id, account.proxyId)
   }
-  state.pools.forEach((pool, index) => {
-    for (const member of pool.members) {
-      if (!rank.has(member.accountId)) rank.set(member.accountId, index)
-    }
-  })
-  return rank
-}
 
-/**
- * Re-packs the whole graph onto the canonical band/lane grid. Entities keep the
- * order dagre suggests when it is available, otherwise their current top-to-
- * bottom order on the canvas.
- *
- * The account band is grouped by owning pool first (pools in state order,
- * 未分配 last) so the one-pool-per-account forest reads as a forest instead of
- * a tangle — the same order the server lays the seed data out in. Coordinates
- * still come from `layoutSlots`, which owns lane wrapping (including the
- * per-kind `LAYOUT.maxRowsPerLane` record), so this file only decides *order*.
- */
-export function autoLayout(state: GraphState): Record<string, XY> {
-  const entities = allEntities(state)
-  if (entities.length === 0) return {}
-
-  const ranks = dagreOrder(state)
-  const slots = layoutSlots(kindCounts(state))
-  const columns = buckets(state)
-  const poolRank = poolRankOf(state)
-  const unassignedRank = state.pools.length
-  const positions: Record<string, XY> = {}
-
-  for (const kind of KIND_ORDER) {
-    const ordered = columns[kind].slice().sort((a, b) => {
-      if (kind === 'account') {
-        const pa = poolRank.get(a.id) ?? unassignedRank
-        const pb = poolRank.get(b.id) ?? unassignedRank
-        if (pa !== pb) return pa - pb
+  let crossings = 0
+  for (const segs of channels.values()) {
+    for (let i = 0; i < segs.length; i += 1) {
+      for (let j = i + 1; j < segs.length; j += 1) {
+        const a = segs[i]
+        const b = segs[j]
+        // Edges sharing an endpoint touch, they do not cross.
+        if (a.source === b.source || a.target === b.target) continue
+        if ((a.sy - b.sy) * (a.ty - b.ty) < 0) crossings += 1
       }
-      const ra = ranks?.get(a.id) ?? a.position.y
-      const rb = ranks?.get(b.id) ?? b.position.y
-      if (ra !== rb) return ra - rb
-      return a.id.localeCompare(b.id)
-    })
-    ordered.forEach((entity, index) => {
-      const slot = slots[kind][index]
-      if (slot) positions[entity.id] = { x: slot.x, y: slot.y }
-    })
+    }
   }
-
-  return positions
+  return crossings
 }

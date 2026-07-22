@@ -16,6 +16,7 @@ import {
   percent,
   type AccountEntity,
   type Entity,
+  type EntityKind,
   type GlobalStats,
   type KeyEntity,
   type PoolEntity,
@@ -28,6 +29,7 @@ import {
   type SimConfig,
 } from '@kpa/shared'
 
+import { EdgeMetricsStore } from './edges.js'
 import { rng } from './rng.js'
 import { createSeedState } from './seed.js'
 import { GraphStore } from './store.js'
@@ -59,6 +61,8 @@ interface RecordInput {
 
 const STATUS_CODE: Record<RequestOutcome, number> = {
   success: 200,
+  'gateway-disabled': 503,
+  'gateway-rate-limited': 429,
   'key-disabled': 403,
   'key-rate-limited': 429,
   'key-quota-exceeded': 402,
@@ -81,6 +85,7 @@ const RETRYABLE: ReadonlySet<RequestOutcome> = new Set<RequestOutcome>([
 ])
 
 const RATE_LIMIT_OUTCOMES: ReadonlySet<RequestOutcome> = new Set<RequestOutcome>([
+  'gateway-rate-limited',
   'key-rate-limited',
   'account-rate-limited',
 ])
@@ -105,6 +110,12 @@ const TIMEOUT_MS = 8_000
 /** How long a `stickySession` pin survives before the strategy picks again. */
 const STICKY_TTL_MS = 20_000
 const MAX_REQUESTS_PER_TICK = 240
+/**
+ * Weight of one request in the rolling rpm estimate (`rpm = rpm * 0.85 +
+ * seen * RPM_WEIGHT` per tick). Shared by the entity metrics roll and the
+ * admission window so the two can never drift apart.
+ */
+const RPM_WEIGHT = (60_000 / TICK_MS) * 0.15
 
 function createStats(now: number): GlobalStats {
   return {
@@ -133,6 +144,7 @@ function p95Of(samples: number[]): number {
 
 export class Simulator {
   private readonly store: GraphStore
+  private readonly edges: EdgeMetricsStore
   private readonly emit: (event: ServerEvent) => void
 
   private config: SimConfig = { ...DEFAULT_CONFIG }
@@ -164,12 +176,28 @@ export class Simulator {
   /** `stickySession`: the account a given key last landed on inside a pool. */
   private sticky = new Map<string, { accountId: string; until: number }>()
 
-  constructor(store: GraphStore, emit: (event: ServerEvent) => void) {
+  /*
+   * Admission control state. `metrics.rpm` counts EVERY arrival — including
+   * the rejections the gate itself produces — so using it for the admission
+   * check meant rejections kept the window saturated and a saturated gate
+   * never admitted anything again (a 120 rpm cap under load became a total
+   * lockout instead of ~120 admitted requests/min). The admission decision
+   * therefore reads this ADMITTED-ONLY rolling rpm, decayed on the same
+   * cadence and formula as `metrics.rpm`, while the entity metrics keep
+   * counting all arrivals for the reconciliation invariant.
+   */
+  private admittedTickCounts = new Map<string, number>()
+  private admittedRpm = new Map<string, number>()
+
+  constructor(store: GraphStore, edges: EdgeMetricsStore, emit: (event: ServerEvent) => void) {
     this.store = store
+    this.edges = edges
     this.emit = emit
     const now = Date.now()
     this.stats = createStats(now)
     this.lastSecondAt = now
+    // Materialise the zeroed metric entry for every relation of the seed graph.
+    this.edges.reset(store.snapshot())
     this.timer = setInterval(() => {
       try {
         this.tick()
@@ -239,6 +267,8 @@ export class Simulator {
     this.traces = []
     this.tickCounts.clear()
     this.secondCounts.clear()
+    this.admittedTickCounts.clear()
+    this.admittedRpm.clear()
     this.latencySamples.clear()
     this.globalLatency = []
     this.logMemo.clear()
@@ -252,11 +282,14 @@ export class Simulator {
     this.secondLatencySum = 0
     this.secondLatencyCount = 0
     this.store.drainDirty()
+    // Full zeroed rebuild of the per-edge metrics; the snapshot carries them.
+    this.edges.reset(this.store.snapshot())
     this.emit({
       type: 'snapshot',
       state: this.store.snapshot(),
       config: this.config,
       stats: this.stats,
+      edges: this.edges.list(),
     })
     this.log('warn', '演示环境已重置为初始拓扑', 'reset')
   }
@@ -278,6 +311,8 @@ export class Simulator {
     this.latencySamples.delete(id)
     this.tickCounts.delete(id)
     this.secondCounts.delete(id)
+    this.admittedTickCounts.delete(id)
+    this.admittedRpm.delete(id)
     this.proxyBlipUntil.delete(id)
     this.p95Dirty.delete(id)
     const suffix = `:${id}`
@@ -296,6 +331,12 @@ export class Simulator {
     this.tickIndex += 1
     this.traceBudget = TRACE_EMIT_BUDGET
 
+    // Reconcile the per-edge metric set against the graph before attributing
+    // traffic to it. Mutation routes already sync, so this is a cheap no-op in
+    // the common case — a pure safety net against a stale relation set.
+    const removedEdgeIds = this.edges.sync(this.store.snapshot())
+    if (removedEdgeIds.length > 0) this.emit({ type: 'removed', ids: [], edgeIds: removedEdgeIds })
+
     this.store.resetQuotaWindows(now)
     this.expireCooldowns(now)
     if (this.tickIndex % 4 === 0) this.jitterHealth(now)
@@ -311,6 +352,9 @@ export class Simulator {
   private flush(): void {
     const entities = this.store.drainDirty()
     if (entities.length > 0) this.emit({ type: 'patch', entities })
+    // One `edges` emission per tick (~4x/second) at most, plus on inject.
+    const edges = this.edges.drainDirty()
+    if (edges.length > 0) this.emit({ type: 'edges', edges })
   }
 
   private generateTraffic(now: number): void {
@@ -399,7 +443,7 @@ export class Simulator {
 
   /** Rolling rpm / in-flight / history buckets / global timeline. */
   private rollWindows(now: number): void {
-    const perMinute = (60_000 / TICK_MS) * 0.15
+    const perMinute = RPM_WEIGHT
     for (const entity of this.store.all()) {
       const seen = this.tickCounts.get(entity.id) ?? 0
       const metrics = entity.metrics
@@ -411,8 +455,18 @@ export class Simulator {
         metrics.inFlight = clamp(inFlight, 0, 9999)
         this.store.markDirty(entity)
       }
+      // Admitted-only rpm decays in lockstep with `metrics.rpm` so the
+      // admission gate and the card read the same instant.
+      const admittedSeen = this.admittedTickCounts.get(entity.id) ?? 0
+      const nextAdmitted = (this.admittedRpm.get(entity.id) ?? 0) * 0.85 + admittedSeen * perMinute
+      if (nextAdmitted < 0.05) this.admittedRpm.delete(entity.id)
+      else this.admittedRpm.set(entity.id, nextAdmitted)
     }
     this.tickCounts.clear()
+    this.admittedTickCounts.clear()
+    // Edge rpm decays on the SAME per-tick cadence and formula as the entities
+    // above, so the edge chip and the node cards describe the same instant.
+    this.edges.rollRpm(perMinute)
 
     // p95 is a sort over a 64-sample window: doing that inside `record` meant
     // ~400 copies+sorts per second at rps 80 for a figure nobody can read
@@ -442,6 +496,8 @@ export class Simulator {
       if (bucket > 0 || dropped > 0) this.store.markDirty(entity)
     }
     this.secondCounts.clear()
+    // Edge history rolls on the SAME simulated second as the entity sparklines.
+    this.edges.rollHistory()
 
     const latency =
       this.secondLatencyCount > 0 ? Math.round(this.secondLatencySum / this.secondLatencyCount) : 0
@@ -486,6 +542,15 @@ export class Simulator {
     const touchedPools = new Set<PoolEntity>()
     let latencyTotal = 0
 
+    /*
+     * Edges credited ONCE per request with the FINAL outcome — gateway->key,
+     * key->pool and the pool->pool failover hops. The per-attempt edges
+     * (pool->account, account->proxy) are credited inside `runAttempt` with
+     * each attempt's own result, so a retried request lights every attempted
+     * account edge but never double-counts the upstream ones.
+     */
+    const deferredEdges: Array<{ sourceId: string; targetId: string; sourceKind: EntityKind }> = []
+
     const finish = (outcome: RequestOutcome, message: string): RouteResult => {
       trace.outcome = outcome
       trace.ok = outcome === 'success'
@@ -496,33 +561,82 @@ export class Simulator {
       if (trace.ok) {
         key.quota.usedTokens += trace.tokensIn + trace.tokensOut
       }
-      this.record(
-        key,
-        {
-          ok: trace.ok,
-          latencyMs: trace.durationMs,
-          rateLimited: RATE_LIMIT_OUTCOMES.has(outcome),
-          tokensIn: trace.tokensIn,
-          tokensOut: trace.tokensOut,
-        },
-        now,
-      )
+      const finalInput = {
+        ok: trace.ok,
+        latencyMs: trace.durationMs,
+        rateLimited: RATE_LIMIT_OUTCOMES.has(outcome),
+        tokensIn: trace.tokensIn,
+        tokensOut: trace.tokensOut,
+      }
+      // The gateway sees EVERY request — including the ones it rejects — so
+      // gateway.metrics.requests always equals the sum of the gateway->key
+      // edges, and each key's requests equal its own gateway->key edge.
+      this.record(gateway, finalInput, now)
+      this.record(key, finalInput, now)
       for (const pool of touchedPools) {
-        this.record(
-          pool,
-          {
-            ok: trace.ok,
-            latencyMs: trace.durationMs,
-            rateLimited: RATE_LIMIT_OUTCOMES.has(outcome),
-            tokensIn: trace.tokensIn,
-            tokensOut: trace.tokensOut,
-          },
+        this.record(pool, finalInput, now)
+      }
+      const tokens = trace.tokensIn + trace.tokensOut
+      for (const edge of deferredEdges) {
+        this.edges.record(
+          edge.sourceId,
+          edge.targetId,
+          edge.sourceKind,
+          { ok: trace.ok, latencyMs: trace.durationMs, tokens },
           now,
         )
       }
       this.commit(trace, forceEmit)
       return { trace }
     }
+
+    /* -- a0. gateway admission -------------------------------------------- */
+    // Every request enters through the singleton gateway before touching its
+    // key, so the gateway->key edge is part of the trace no matter the outcome.
+
+    const gateway = this.store.getGateway()
+    deferredEdges.push({ sourceId: gateway.id, targetId: key.id, sourceKind: 'gateway' })
+    addEdge(trace, gateway.id, key.id)
+
+    if (!gateway.enabled) {
+      // The console-wide kill switch: nothing passes a disabled gateway.
+      trace.path.push(hop('gateway', gateway.id, gateway.name, '网关已停用，入口关闭', false, 0))
+      this.log('warn', `网关「${gateway.name}」已停用，所有请求被拒绝`, `gw-disabled:${gateway.id}`)
+      return finish('gateway-disabled', `网关「${gateway.name}」已停用，请求在入口被拒绝`)
+    }
+    if (
+      this.config.rateLimitEnabled &&
+      gateway.rateLimit.rpm > 0 &&
+      this.admittedRpmOf(gateway.id) >= gateway.rateLimit.rpm
+    ) {
+      // Global admission control — only enforced when a ceiling is configured
+      // (rpm 0 = unlimited, the default). Checked against the ADMITTED-only
+      // window so the rejections this gate produces cannot starve it shut.
+      trace.path.push(
+        hop(
+          'gateway',
+          gateway.id,
+          gateway.name,
+          `全局 RPM ${Math.round(this.admittedRpmOf(gateway.id))}/${gateway.rateLimit.rpm} 触顶`,
+          false,
+          0,
+        ),
+      )
+      return finish('gateway-rate-limited', `网关全局限流：RPM 超过 ${gateway.rateLimit.rpm}`)
+    }
+    this.noteAdmitted(gateway.id)
+    trace.path.push(
+      hop(
+        'gateway',
+        gateway.id,
+        gateway.name,
+        `入口放行 · ${gateway.endpoint} · RPM ${Math.round(this.admittedRpmOf(gateway.id))}/${
+          gateway.rateLimit.rpm || '∞'
+        }`,
+        true,
+        0,
+      ),
+    )
 
     /* -- a. key gate ------------------------------------------------------ */
 
@@ -535,13 +649,17 @@ export class Simulator {
       this.log('warn', `密钥「${key.name}」已过期，请求被拒绝`, `key-expired:${key.id}`)
       return finish('key-disabled', `密钥「${key.name}」已过期`)
     }
-    if (this.config.rateLimitEnabled && key.rateLimit.rpm > 0 && key.metrics.rpm >= key.rateLimit.rpm) {
+    if (
+      this.config.rateLimitEnabled &&
+      key.rateLimit.rpm > 0 &&
+      this.admittedRpmOf(key.id) >= key.rateLimit.rpm
+    ) {
       trace.path.push(
         hop(
           'key',
           key.id,
           key.name,
-          `RPM ${Math.round(key.metrics.rpm)}/${key.rateLimit.rpm} 触顶`,
+          `RPM ${Math.round(this.admittedRpmOf(key.id))}/${key.rateLimit.rpm} 触顶`,
           false,
           0,
         ),
@@ -570,12 +688,13 @@ export class Simulator {
       this.log('warn', `密钥「${key.name}」配额耗尽，请求被拒绝`, `key-quota:${key.id}`)
       return finish('key-quota-exceeded', `密钥配额耗尽（${key.quota.limitTokens} tokens）`)
     }
+    this.noteAdmitted(key.id)
     trace.path.push(
       hop(
         'key',
         key.id,
         key.name,
-        `校验通过 · RPM ${Math.round(key.metrics.rpm)}/${key.rateLimit.rpm || '∞'} · 配额 ${Math.round(
+        `校验通过 · RPM ${Math.round(this.admittedRpmOf(key.id))}/${key.rateLimit.rpm || '∞'} · 配额 ${Math.round(
           percent(key.quota.usedTokens, key.quota.limitTokens),
         )}%`,
         true,
@@ -609,6 +728,7 @@ export class Simulator {
           : `优先级 ${resolved[chosenIndex].binding.priority} 接管（前 ${chosenIndex} 个池不可用）`
       trace.path.push(hop('pool', pool.id, pool.name, poolReason, true, 0))
       addEdge(trace, key.id, pool.id)
+      deferredEdges.push({ sourceId: key.id, targetId: pool.id, sourceKind: 'key' })
     } else {
       // Every bound pool is down: try a configured spill-over target first.
       const spill = this.config.failoverEnabled
@@ -627,11 +747,13 @@ export class Simulator {
       pool = spill.to
       trace.path.push(hop('pool', spill.from.id, spill.from.name, '池内无可用账号', false, 0))
       addEdge(trace, key.id, spill.from.id)
+      deferredEdges.push({ sourceId: key.id, targetId: spill.from.id, sourceKind: 'key' })
       touchedPools.add(spill.from)
       trace.path.push(hop('pool', pool.id, pool.name, '溢出到备用池', true, 0))
       // Without this hop the highlighted path is two disconnected arrows: one
       // into the dead pool and one out of the backup, with nothing joining them.
       addEdge(trace, spill.from.id, pool.id)
+      deferredEdges.push({ sourceId: spill.from.id, targetId: pool.id, sourceKind: 'pool' })
       this.log('warn', `「${pool.name}」接管「${spill.from.name}」的溢出流量`, `spill:${pool.id}`)
     }
 
@@ -658,6 +780,7 @@ export class Simulator {
             trace.path.push(hop('pool', backup.id, backup.name, '溢出到备用池', true, 0))
             // Keep the highlighted path connected across the failover hop.
             addEdge(trace, previousPoolId, backup.id)
+            deferredEdges.push({ sourceId: previousPoolId, targetId: backup.id, sourceKind: 'pool' })
             this.log('warn', `「${pool.name}」接管溢出流量（主池无可用账号）`, `failover:${backup.id}`)
             tried.clear()
             continue
@@ -668,6 +791,11 @@ export class Simulator {
       }
 
       tried.add(candidate.account.id)
+      // A retry only becomes real when a subsequent attempt actually STARTS.
+      // Counting it at the retry decision left a phantom retry on requests
+      // whose next selectAccount came back empty (all accounts tried), which
+      // over-counted stats.retries versus the attempts actually made.
+      if (last) trace.retries += 1
       const result = this.runAttempt(trace, pool, candidate, now)
       latencyTotal += result.latencyMs
       last = result
@@ -696,8 +824,23 @@ export class Simulator {
       const canRetry =
         this.config.failoverEnabled && RETRYABLE.has(result.outcome) && attempt < pool.maxRetries
       if (!canRetry) return finish(result.outcome, result.message)
-      trace.retries += 1
     }
+  }
+
+  /**
+   * Rolling ADMITTED-only rpm of an entity — the admission gate's read side.
+   * The CURRENT tick's admissions are counted at the same weight the next
+   * roll would give them, so a burst arriving inside one tick cannot sail
+   * past the ceiling on a stale estimate.
+   */
+  private admittedRpmOf(id: string): number {
+    const pending = this.admittedTickCounts.get(id) ?? 0
+    return (this.admittedRpm.get(id) ?? 0) + pending * RPM_WEIGHT
+  }
+
+  /** Count one admitted request against an entity's admission window. */
+  private noteAdmitted(id: string): void {
+    this.admittedTickCounts.set(id, (this.admittedTickCounts.get(id) ?? 0) + 1)
   }
 
   /** A pool can take traffic when it is enabled, serving and under its ceiling. */
@@ -852,24 +995,33 @@ export class Simulator {
     trace.accountId = account.id
     addEdge(trace, pool.id, account.id)
 
+    // Per-ATTEMPT edge attribution: every attempted pool->account edge (and
+    // its account->proxy hop) is credited with that attempt's own result, so
+    // a retried request lights each account it actually touched.
+    const creditAccountEdge = (ok: boolean, latencyMs: number, tokens = 0): void =>
+      this.edges.record(pool.id, account.id, 'pool', { ok, latencyMs, tokens }, now)
+    const creditProxyEdge = (proxyId: string, ok: boolean, latencyMs: number, tokens = 0): void =>
+      this.edges.record(account.id, proxyId, 'account', { ok, latencyMs, tokens }, now)
+
     /* -- d. account gate -------------------------------------------------- */
 
     if (
       this.config.rateLimitEnabled &&
       account.rateLimit.rpm > 0 &&
-      account.metrics.rpm >= account.rateLimit.rpm
+      this.admittedRpmOf(account.id) >= account.rateLimit.rpm
     ) {
       trace.path.push(
         hop(
           'account',
           account.id,
           account.name,
-          `${reason} · RPM ${Math.round(account.metrics.rpm)}/${account.rateLimit.rpm} 触顶`,
+          `${reason} · RPM ${Math.round(this.admittedRpmOf(account.id))}/${account.rateLimit.rpm} 触顶`,
           false,
           0,
         ),
       )
       this.record(account, { ok: false, latencyMs: 0, rateLimited: true }, now)
+      creditAccountEdge(false, 0)
       return {
         ok: false,
         outcome: 'account-rate-limited',
@@ -894,6 +1046,7 @@ export class Simulator {
         ),
       )
       this.record(account, { ok: false, latencyMs: 0, rateLimited: true }, now)
+      creditAccountEdge(false, 0)
       return {
         ok: false,
         outcome: 'account-rate-limited',
@@ -905,6 +1058,7 @@ export class Simulator {
     if (account.quota.limitTokens > 0 && account.quota.usedTokens >= account.quota.limitTokens) {
       trace.path.push(hop('account', account.id, account.name, `${reason} · 配额耗尽`, false, 0))
       this.record(account, { ok: false, latencyMs: 0 }, now)
+      creditAccountEdge(false, 0)
       this.log('warn', `账号「${account.name}」配额耗尽，退出调度`, `acc-quota:${account.id}`)
       return {
         ok: false,
@@ -913,6 +1067,8 @@ export class Simulator {
         latencyMs: 0,
       }
     }
+
+    this.noteAdmitted(account.id)
 
     /* -- e. proxy hop ----------------------------------------------------- */
 
@@ -929,9 +1085,11 @@ export class Simulator {
           addEdge(trace, account.id, bound.id)
           trace.path.push(hop('proxy', bound.id, bound.name, '代理离线，无法出网', false, 0))
           this.record(bound, { ok: false, latencyMs: 0 }, now)
+          creditProxyEdge(bound.id, false, 0)
           this.log('error', `代理「${bound.name}」不可用，链路中断`, `proxy-err:${bound.id}`)
         }
         this.record(account, { ok: false, latencyMs: 0 }, now)
+        creditAccountEdge(false, 0)
         this.failAccount(account, '代理不可达', now)
         return {
           ok: false,
@@ -962,7 +1120,9 @@ export class Simulator {
           ),
         )
         this.record(proxy, { ok: false, latencyMs: 0 }, now)
+        creditProxyEdge(proxy.id, false, 0)
         this.record(account, { ok: false, latencyMs: 0 }, now)
+        creditAccountEdge(false, 0)
         this.log('warn', `代理「${proxy.name}」并发触顶，请求被拒绝`, `proxy-busy:${proxy.id}`)
         return {
           ok: false,
@@ -985,7 +1145,9 @@ export class Simulator {
           ),
         )
         this.record(proxy, { ok: false, latencyMs: proxyLatency }, now)
+        creditProxyEdge(proxy.id, false, proxyLatency)
         this.record(account, { ok: false, latencyMs: proxyLatency }, now)
+        creditAccountEdge(false, proxyLatency)
         this.failAccount(account, '代理丢包', now)
         return {
           ok: false,
@@ -1030,6 +1192,7 @@ export class Simulator {
         hop('account', account.id, account.name, reason, true, Math.round(latency - proxyLatency)),
       )
       this.record(account, { ok: true, latencyMs: latency, tokensIn, tokensOut }, now)
+      creditAccountEdge(true, latency, tokensIn + tokensOut)
 
       if (proxy) {
         proxy.health.latencyMs = proxy.health.latencyMs * 0.9 + proxyLatency * 0.1
@@ -1044,6 +1207,7 @@ export class Simulator {
           ),
         )
         this.record(proxy, { ok: true, latencyMs: proxyLatency, tokensIn, tokensOut }, now)
+        creditProxyEdge(proxy.id, true, proxyLatency, tokensIn + tokensOut)
       }
 
       return { ok: true, outcome: 'success', message: '上游返回 200', latencyMs: latency }
@@ -1065,11 +1229,13 @@ export class Simulator {
       ),
     )
     this.record(account, { ok: false, latencyMs: latency }, now)
+    creditAccountEdge(false, latency)
     if (proxy) {
       trace.path.push(
         hop('proxy', proxy.id, proxy.name, `已转发，上游失败`, false, Math.round(proxyLatency)),
       )
       this.record(proxy, { ok: false, latencyMs: proxyLatency }, now)
+      creditProxyEdge(proxy.id, false, proxyLatency)
     }
     this.failAccount(account, message, now)
 

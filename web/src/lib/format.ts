@@ -12,6 +12,7 @@ import {
   Globe,
   KeyRound,
   Layers,
+  Network,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -53,6 +54,8 @@ export function statusTone(s: HealthStatus): Tone {
 
 const OUTCOME_LABEL_CN: Record<RequestOutcome, string> = {
   success: '成功',
+  'gateway-disabled': '网关停用',
+  'gateway-rate-limited': '网关限流',
   'key-disabled': '密钥停用',
   'key-rate-limited': '密钥限流',
   'key-quota-exceeded': '密钥配额耗尽',
@@ -68,6 +71,8 @@ const OUTCOME_LABEL_CN: Record<RequestOutcome, string> = {
 
 const OUTCOME_TONE: Record<RequestOutcome, 'ok' | 'warn' | 'danger'> = {
   success: 'ok',
+  'gateway-disabled': 'danger',
+  'gateway-rate-limited': 'warn',
   'key-disabled': 'warn',
   'key-rate-limited': 'warn',
   'key-quota-exceeded': 'warn',
@@ -96,6 +101,7 @@ export function kindLabel(k: EntityKind): string {
 }
 
 const KIND_ICON: Record<EntityKind, LucideIcon> = {
+  gateway: Network,
   key: KeyRound,
   pool: Layers,
   account: CircleUser,

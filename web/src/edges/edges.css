@@ -1,10 +1,26 @@
 /* ------------------------------------------------------------------ edges --
-   Traffic-carrying bezier edges. Colour comes from the source entity kind via
-   the [data-kind] helper defined in theme.css, so nothing here is hardcoded. */
+   Traffic-carrying bezier edges.
+
+   COLOUR SEMANTICS (feature 4): the stroke answers exactly ONE question — is
+   this path live? GREEN (--ok) when BOTH endpoints are enabled, GREY when
+   either endpoint is disabled. The owner asked for "node on -> its upstream
+   line is green, node off -> grey"; the rule is extended to the source side
+   as well, because a live-green line dangling off a visibly disabled source
+   card would read as a bug. The four kind accents therefore lost their
+   edge-stroke job: kind identity now lives in the chip (micro-bar colour and
+   chip border via [data-kind]) and in the traffic particles.
+
+   A dead path is also dead in SHAPE — thinner (JS), dashed, particle-free,
+   chip muted — so the state survives greyscale and colour-blind viewing. */
 
 .kpa-edge {
-  --edge-color: var(--accent, var(--border-strong));
+  --edge-color: var(--ok);
   transition: opacity var(--transition);
+}
+
+/* Either endpoint disabled -> grey, dashed, quiet. */
+.kpa-edge[data-live='false'] {
+  --edge-color: var(--text-faint);
 }
 
 .kpa-edge path.kpa-edge__path {
@@ -17,6 +33,13 @@
     stroke var(--transition);
 }
 
+.kpa-edge[data-live='false'] path.kpa-edge__path,
+.kpa-edge[data-disabled='true'] path.kpa-edge__path {
+  stroke: var(--text-faint);
+  stroke-dasharray: 6 6;
+  opacity: 0.4;
+}
+
 /* Beat React Flow's own `.react-flow__edge.selected .react-flow__edge-path` rule. */
 .react-flow__edge:hover .kpa-edge path.kpa-edge__path,
 .react-flow__edge.selected .kpa-edge path.kpa-edge__path,
@@ -26,6 +49,7 @@
   opacity: 1;
 }
 
+.react-flow__edge.selected .kpa-edge[data-live='false'] path.kpa-edge__path,
 .react-flow__edge.selected .kpa-edge[data-disabled='true'] path.kpa-edge__path {
   stroke: var(--text-dim);
 }
@@ -36,31 +60,26 @@
   opacity: 1;
 }
 
+/* Traced path: a slow breathing glow (opacity-only on a blurred stroke). */
 .kpa-edge__halo {
   stroke: var(--edge-color);
   stroke-linecap: round;
   opacity: 0.22;
   filter: blur(2px);
-  animation: kpa-edge-halo 1.6s ease-in-out infinite;
+  animation: kpa-edge-halo 2.8s ease-in-out infinite;
 }
 
 @keyframes kpa-edge-halo {
   0%,
   100% {
-    opacity: 0.16;
+    opacity: 0.14;
   }
   50% {
-    opacity: 0.34;
+    opacity: 0.38;
   }
 }
 
-/* --- disabled / dimmed ----------------------------------------------- */
-
-.kpa-edge[data-disabled='true'] path.kpa-edge__path {
-  stroke: var(--text-dim);
-  stroke-dasharray: 6 6;
-  opacity: 0.4;
-}
+/* --- dimmed ----------------------------------------------------------- */
 
 .kpa-edge[data-dimmed='true'] {
   opacity: 0.12;
@@ -68,7 +87,11 @@
 }
 
 .kpa-edge[data-dimmed='true'] .kpa-edge__particle,
-.kpa-edge[data-dimmed='true'] .kpa-edge__flash {
+.kpa-edge[data-dimmed='true'] .kpa-edge__flash,
+.kpa-edge[data-live='false'] .kpa-edge__particle,
+.kpa-edge[data-live='false'] .kpa-edge__flash,
+.kpa-edge[data-disabled='true'] .kpa-edge__particle,
+.kpa-edge[data-disabled='true'] .kpa-edge__flash {
   display: none;
 }
 
@@ -99,6 +122,51 @@
   fill: var(--particle-color);
   opacity: 0.22;
   animation: kpa-particle-halo 900ms linear forwards;
+}
+
+/* Comet tail: two ghosts offset behind the core along the travel direction
+   (the particle group follows the path with rotate="auto", so a negative cx
+   is always "behind"). Opacity-only fades, same lifetime as the core. */
+.kpa-edge__particle-tail {
+  fill: var(--particle-color);
+}
+
+.kpa-edge__particle-tail--a {
+  animation: kpa-particle-tail-a 900ms linear forwards;
+}
+
+.kpa-edge__particle-tail--b {
+  animation: kpa-particle-tail-b 900ms linear forwards;
+}
+
+@keyframes kpa-particle-tail-a {
+  0% {
+    opacity: 0;
+  }
+  18% {
+    opacity: 0.4;
+  }
+  80% {
+    opacity: 0.35;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes kpa-particle-tail-b {
+  0% {
+    opacity: 0;
+  }
+  22% {
+    opacity: 0.2;
+  }
+  78% {
+    opacity: 0.16;
+  }
+  100% {
+    opacity: 0;
+  }
 }
 
 @keyframes kpa-particle-fade {
@@ -162,42 +230,163 @@
   }
 }
 
-/* --- midpoint label pill ---------------------------------------------- */
+/* --- midpoint chip ----------------------------------------------------- */
 
-.kpa-edge-label {
+/* The old bare label pill was MERGED into this chip: one floating element per
+   edge, holding label · micro bars · total · success rate. The wrap is inert;
+   only the chip itself takes pointer events (EdgeLabelRenderer contract). */
+
+.kpa-edge-chip-wrap {
   position: absolute;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.kpa-edge-chip {
   pointer-events: all;
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  max-width: 168px;
-  padding: 1px 7px;
-  border: 1px solid var(--border);
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
   border-radius: var(--radius-pill);
   background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
-  line-height: 1.6;
+  line-height: 1.5;
   letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   box-shadow: var(--shadow-sm);
   transition:
-    color var(--transition),
     border-color var(--transition),
-    background var(--transition);
+    background var(--transition),
+    opacity var(--transition);
 }
 
-.kpa-edge-label:hover,
-.kpa-edge-label[data-traced='true'] {
-  color: var(--accent);
+.kpa-edge-chip--compact {
+  gap: 0;
+  padding: 2px 6px;
+}
+
+.kpa-edge-chip:hover,
+.kpa-edge-chip-wrap[data-traced='true'] .kpa-edge-chip {
   border-color: var(--accent);
-  background: color-mix(in srgb, var(--bg-panel) 80%, var(--accent-soft));
+  background: color-mix(in srgb, var(--bg-panel) 82%, var(--accent-soft));
 }
 
-.kpa-edge-label[data-disabled='true'] {
-  color: var(--text-dim);
+/* Dead path (feature 4): the chip mutes with the line. */
+.kpa-edge-chip-wrap[data-live='false'] .kpa-edge-chip {
+  opacity: 0.55;
+  border-color: var(--border);
   border-style: dashed;
+}
+
+.kpa-edge-chip-wrap[data-live='false'] .kpa-edge-chip__label {
+  color: var(--text-dim);
+}
+
+.kpa-edge-chip__label {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.kpa-edge-chip__bars {
+  display: block;
+  flex: none;
+}
+
+/* Reserved widths: the numbers tick up to 4x/s and must never move the chip. */
+.kpa-edge-chip__total {
+  min-width: 4.5ch;
+  color: var(--text);
+  text-align: right;
+}
+
+.kpa-edge-chip__rate {
+  min-width: 4ch;
+  text-align: right;
+}
+
+.kpa-edge-chip__rate[data-tone='ok'] {
+  color: var(--ok);
+}
+.kpa-edge-chip__rate[data-tone='warn'] {
+  color: var(--warn);
+}
+.kpa-edge-chip__rate[data-tone='danger'] {
+  color: var(--danger);
+}
+
+/* Idle-but-alive relation: an explicit muted zero, not an empty chart. */
+.kpa-edge-chip__zero {
+  color: var(--text-dim);
+}
+
+.kpa-edge-chip--idle {
+  border-color: var(--border);
+}
+
+/* --- chip hover popover ------------------------------------------------ */
+
+.kpa-edge-chip__pop {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  flex-direction: column;
+  gap: 2px;
+  width: 176px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-elevated) 96%, transparent);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  z-index: 12;
+}
+
+.kpa-edge-chip:hover .kpa-edge-chip__pop {
+  display: flex;
+}
+
+.kpa-edge-chip__pop-title {
+  margin-bottom: 2px;
+  color: var(--accent);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kpa-edge-chip__pop-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.kpa-edge-chip__pop-row span {
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-size: var(--fs-xs);
+}
+
+.kpa-edge-chip__pop-row b {
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.kpa-edge-chip__pop-row b[data-tone='ok'] {
+  color: var(--ok);
+}
+.kpa-edge-chip__pop-row b[data-tone='warn'] {
+  color: var(--warn);
+}
+.kpa-edge-chip__pop-row b[data-tone='danger'] {
+  color: var(--danger);
 }

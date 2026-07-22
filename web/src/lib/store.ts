@@ -12,9 +12,12 @@ import { create } from 'zustand'
 import {
   ENTITY_KINDS,
   TRACE_BUFFER_SIZE,
+  createMetrics,
   type AccountEntity,
+  type EdgeMetrics,
   type Entity,
   type EntityKind,
+  type GatewayEntity,
   type GlobalStats,
   type GraphState,
   type KeyEntity,
@@ -27,6 +30,7 @@ import {
 } from '@kpa/shared'
 
 import { api } from './api'
+import { autoLayout } from './graph'
 import { connectSocket } from './socket'
 
 export type ConnectionState = 'connecting' | 'open' | 'closed'
@@ -35,6 +39,20 @@ export interface LogLine {
   id: string
   level: 'info' | 'warn' | 'error'
   message: string
+  at: number
+}
+
+/**
+ * A user-facing announcement pushed by the server (feature 10), queued FIFO so
+ * a burst shows one dialog at a time. The surface layer renders `notices[0]`
+ * and calls `dismissNotice()` to advance the queue.
+ */
+export interface Notice {
+  id: string
+  level: 'info' | 'warn' | 'error'
+  title: string
+  message: string
+  entityIds: string[]
   at: number
 }
 
@@ -69,10 +87,17 @@ export interface ConsoleStore {
   stats: GlobalStats
   traces: RequestTrace[]
   logs: LogLine[]
+  notices: Notice[]
   connection: ConnectionState
   ready: boolean
   edgeActivity: Record<string, EdgeActivity>
   nodeActivity: Record<string, NodeActivity>
+  /**
+   * Per-relation rolling counters, keyed by `edgeId(source, target)` — the
+   * same id the React Flow edge uses. Fed by the snapshot, the `edges` event
+   * (changed edges only, <= ~4x/s) and pruned through `removed.edgeIds`.
+   */
+  edgeMetrics: Record<string, EdgeMetrics>
   selectedId: string | null
   activeTraceId: string | null
   search: string
@@ -80,6 +105,10 @@ export interface ConsoleStore {
   onlyProblems: boolean
   showMiniMap: boolean
   logCollapsed: boolean
+  /** True while an auto-layout transition is animating node transforms. */
+  layoutAnimating: boolean
+  /** Bumped once per applied auto layout; the canvas listens to re-fit the view. */
+  layoutEpoch: number
   select(id: string | null): void
   setActiveTrace(id: string | null): void
   setSearch(v: string): void
@@ -88,12 +117,16 @@ export interface ConsoleStore {
   resetFilters(): void
   toggleMiniMap(): void
   toggleLog(): void
+  pushLog(level: LogLine['level'], message: string): void
+  dismissNotice(): void
   applyServerEvent(ev: ServerEvent): void
   connect(): () => void
   createEntity(kind: EntityKind, draft?: Record<string, unknown>): Promise<void>
   updateEntity(kind: EntityKind, id: string, patch: Record<string, unknown>): Promise<void>
   deleteEntity(kind: EntityKind, id: string): Promise<void>
   moveEntity(id: string, position: XY): Promise<void>
+  /** Computes `autoLayout()` and persists the whole layout in ONE move-batch request. */
+  applyAutoLayout(): Promise<void>
   bind(source: EntityRef, target: EntityRef): Promise<void>
   unbind(source: EntityRef, target: EntityRef): Promise<void>
   setSim(patch: Partial<SimConfig>): Promise<void>
@@ -104,9 +137,43 @@ export interface ConsoleStore {
 /* ------------------------------------------------------------- defaults -- */
 
 const LOG_BUFFER_SIZE = 100
+const NOTICE_QUEUE_SIZE = 20
 const TRACE_FLUSH_MS = 100
 
-const EMPTY_STATE: GraphState = { keys: [], pools: [], accounts: [], proxies: [], updatedAt: 0 }
+/** How long the auto-layout node transition runs (CSS uses 420ms). */
+export const LAYOUT_ANIM_MS = 460
+
+/**
+ * Placeholder for the gateway singleton before the first snapshot arrives.
+ * `id: ''` is the sentinel `buildGraph` uses to skip rendering it.
+ */
+function placeholderGateway(): GatewayEntity {
+  return {
+    id: '',
+    kind: 'gateway',
+    name: 'Gateway',
+    enabled: true,
+    status: 'healthy',
+    tags: [],
+    note: '',
+    createdAt: 0,
+    updatedAt: 0,
+    position: { x: 0, y: 0 },
+    metrics: createMetrics(),
+    endpoint: '',
+    rateLimit: { rpm: 0, concurrency: 0 },
+    version: '',
+  }
+}
+
+const EMPTY_STATE: GraphState = {
+  gateway: placeholderGateway(),
+  keys: [],
+  pools: [],
+  accounts: [],
+  proxies: [],
+  updatedAt: 0,
+}
 
 const DEFAULT_CONFIG: SimConfig = {
   running: false,
@@ -134,6 +201,7 @@ const EMPTY_STATS: GlobalStats = {
 }
 
 const ALL_KINDS_ON: Record<EntityKind, boolean> = {
+  gateway: true,
   key: true,
   pool: true,
   account: true,
@@ -143,6 +211,7 @@ const ALL_KINDS_ON: Record<EntityKind, boolean> = {
 /* -------------------------------------------------------------- helpers -- */
 
 let logSeq = 0
+let noticeSeq = 0
 
 function makeLog(level: LogLine['level'], message: string, at = Date.now()): LogLine {
   logSeq += 1
@@ -150,6 +219,7 @@ function makeLog(level: LogLine['level'], message: string, at = Date.now()): Log
 }
 
 function findEntity(state: GraphState, id: string): Entity | undefined {
+  if (state.gateway?.id === id) return state.gateway
   return (
     state.keys.find((e) => e.id === id) ??
     state.pools.find((e) => e.id === id) ??
@@ -176,12 +246,20 @@ function upsertInto<T extends Entity>(list: T[], incoming: T[]): T[] {
 
 function upsertEntities(state: GraphState, entities: Entity[]): GraphState {
   if (entities.length === 0) return state
+  let gateway = state.gateway
   const keys: KeyEntity[] = []
   const pools: PoolEntity[] = []
   const accounts: AccountEntity[] = []
   const proxies: ProxyEntity[] = []
   for (const entity of entities) {
     switch (entity.kind) {
+      case 'gateway': {
+        // The gateway is a SINGLETON field, not a list entry; a patch simply
+        // replaces it (an unacknowledged local drag still wins, as above).
+        const local = movePending.get(entity.id)
+        gateway = local ? { ...entity, position: local } : entity
+        break
+      }
       case 'key':
         keys.push(entity)
         break
@@ -197,6 +275,7 @@ function upsertEntities(state: GraphState, entities: Entity[]): GraphState {
     }
   }
   return {
+    gateway,
     keys: upsertInto(state.keys, keys),
     pools: upsertInto(state.pools, pools),
     accounts: upsertInto(state.accounts, accounts),
@@ -209,6 +288,8 @@ function removeEntities(state: GraphState, ids: string[]): GraphState {
   if (ids.length === 0) return state
   const gone = new Set(ids)
   return {
+    // The gateway can never be deleted; `removed` never carries its id.
+    gateway: state.gateway,
     keys: state.keys.filter((e) => !gone.has(e.id)),
     pools: state.pools.filter((e) => !gone.has(e.id)),
     accounts: state.accounts.filter((e) => !gone.has(e.id)),
@@ -217,21 +298,33 @@ function removeEntities(state: GraphState, ids: string[]): GraphState {
   }
 }
 
-function withPosition(state: GraphState, id: string, position: XY): GraphState {
+function withPositions(state: GraphState, positions: Record<string, XY>): GraphState {
   const patch = <T extends Entity>(list: T[]): T[] => {
-    const index = list.findIndex((entry) => entry.id === id)
-    if (index < 0) return list
-    const next = list.slice()
-    next[index] = { ...next[index], position } as T
-    return next
+    let changed = false
+    const next = list.map((entry) => {
+      const position = positions[entry.id]
+      if (!position) return entry
+      changed = true
+      return { ...entry, position } as T
+    })
+    return changed ? next : list
   }
+  const gatewayPosition = state.gateway ? positions[state.gateway.id] : undefined
   return {
+    gateway: gatewayPosition ? { ...state.gateway, position: gatewayPosition } : state.gateway,
     keys: patch(state.keys),
     pools: patch(state.pools),
     accounts: patch(state.accounts),
     proxies: patch(state.proxies),
     updatedAt: state.updatedAt,
   }
+}
+
+function indexEdges(list: EdgeMetrics[]): Record<string, EdgeMetrics> {
+  const out: Record<string, EdgeMetrics> = {}
+  if (!Array.isArray(list)) return out
+  for (const edge of list) out[edge.id] = edge
+  return out
 }
 
 /* ------------------------------------------------------- trace batching -- */
@@ -346,6 +439,9 @@ let socketTeardown: number | null = null
 const movePending = new Map<string, XY>()
 const moveInFlight = new Set<string>()
 
+/** Timer that ends the auto-layout transition window. */
+let layoutAnimTimer: number | null = null
+
 /* ---------------------------------------------------------------- store -- */
 
 export const useConsole = create<ConsoleStore>()((set, get) => {
@@ -360,7 +456,13 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
   const bootstrap = async (): Promise<void> => {
     try {
       const data = await api.getState()
-      set({ state: data.state, config: data.config, stats: data.stats, ready: true })
+      set({
+        state: data.state,
+        config: data.config,
+        stats: data.stats,
+        edgeMetrics: indexEdges(data.edges),
+        ready: true,
+      })
     } catch (error) {
       fail('加载状态', error)
       return
@@ -380,10 +482,12 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
     stats: EMPTY_STATS,
     traces: [],
     logs: [],
+    notices: [],
     connection: 'connecting',
     ready: false,
     edgeActivity: {},
     nodeActivity: {},
+    edgeMetrics: {},
     selectedId: null,
     activeTraceId: null,
     search: '',
@@ -391,6 +495,8 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
     onlyProblems: false,
     showMiniMap: true,
     logCollapsed: false,
+    layoutAnimating: false,
+    layoutEpoch: 0,
 
     /* -------------------------------------------------------- ui state -- */
 
@@ -426,36 +532,70 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
       set((prev) => ({ logCollapsed: !prev.logCollapsed }))
     },
 
+    pushLog(level, message) {
+      pushLog(level, message)
+    },
+
+    dismissNotice() {
+      set((prev) => ({ notices: prev.notices.slice(1) }))
+    },
+
     /* ---------------------------------------------------- server events -- */
 
     applyServerEvent(ev) {
       switch (ev.type) {
         case 'snapshot':
-          set({ state: ev.state, config: ev.config, stats: ev.stats, ready: true })
+          set({
+            state: ev.state,
+            config: ev.config,
+            stats: ev.stats,
+            edgeMetrics: indexEdges(ev.edges),
+            ready: true,
+          })
           break
         case 'patch':
           set((prev) => ({ state: upsertEntities(prev.state, ev.entities) }))
           break
         case 'removed': {
-          const gone = new Set(ev.ids)
+          const ids = ev.ids ?? []
+          const gone = new Set(ids)
+          const deadEdges = new Set(ev.edgeIds ?? [])
           set((prev) => {
             const nodeActivity = { ...prev.nodeActivity }
-            for (const id of ev.ids) delete nodeActivity[id]
+            for (const id of ids) delete nodeActivity[id]
             const edgeActivity: Record<string, EdgeActivity> = {}
             for (const [id, activity] of Object.entries(prev.edgeActivity)) {
+              if (deadEdges.has(id)) continue
               const [source, target] = id.split('->')
               if (gone.has(source) || gone.has(target)) continue
               edgeActivity[id] = activity
             }
+            // Edge metrics die the moment their relation does: the server
+            // names them in `edgeIds`, and removed entities take their edges
+            // with them even if a frame arrives out of order.
+            const edgeMetrics: Record<string, EdgeMetrics> = {}
+            for (const [id, metrics] of Object.entries(prev.edgeMetrics)) {
+              if (deadEdges.has(id)) continue
+              if (gone.has(metrics.sourceId) || gone.has(metrics.targetId)) continue
+              edgeMetrics[id] = metrics
+            }
             return {
-              state: removeEntities(prev.state, ev.ids),
+              state: removeEntities(prev.state, ids),
               nodeActivity,
               edgeActivity,
+              edgeMetrics,
               selectedId: prev.selectedId && gone.has(prev.selectedId) ? null : prev.selectedId,
             }
           })
           break
         }
+        case 'edges':
+          set((prev) => {
+            const edgeMetrics = { ...prev.edgeMetrics }
+            for (const edge of ev.edges) edgeMetrics[edge.id] = edge
+            return { edgeMetrics }
+          })
+          break
         case 'trace':
           enqueueTrace(ev.trace)
           break
@@ -470,6 +610,27 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
             logs: [makeLog(ev.level, ev.message, ev.at), ...prev.logs].slice(0, LOG_BUFFER_SIZE),
           }))
           break
+        case 'notice': {
+          noticeSeq += 1
+          const notice: Notice = {
+            id: `notice-${noticeSeq}`,
+            level: ev.level,
+            title: ev.title,
+            message: ev.message,
+            entityIds: ev.entityIds ?? [],
+            at: ev.at,
+          }
+          set((prev) => ({
+            notices: [...prev.notices, notice].slice(-NOTICE_QUEUE_SIZE),
+            // Notices also land in the operator log so nothing is lost when
+            // the dialog is dismissed fast.
+            logs: [makeLog(ev.level, `${ev.title}：${ev.message}`, ev.at), ...prev.logs].slice(
+              0,
+              LOG_BUFFER_SIZE,
+            ),
+          }))
+          break
+        }
       }
     },
 
@@ -543,16 +704,15 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
     /**
      * Optimistic local move, then a write that starts immediately.
      *
-     * `moveEntity` is only ever called from `onNodeDragStop` and the auto
-     * layout button, never per animation frame, so a debounce bought nothing
-     * and cost an 80ms window in which a server patch could snap the node
-     * back. Instead the newest position stays in `movePending` — which
-     * `upsertEntities` honours — until the server acknowledges *that* exact
-     * position; concurrent calls for the same id collapse into the running
-     * loop rather than racing each other.
+     * `moveEntity` is only ever called from `onNodeDragStop`, never per
+     * animation frame, so a debounce bought nothing and cost an 80ms window in
+     * which a server patch could snap the node back. Instead the newest
+     * position stays in `movePending` — which `upsertEntities` honours — until
+     * the server acknowledges *that* exact position; concurrent calls for the
+     * same id collapse into the running loop rather than racing each other.
      */
     async moveEntity(id, position) {
-      set((prev) => ({ state: withPosition(prev.state, id, position) }))
+      set((prev) => ({ state: withPositions(prev.state, { [id]: position }) }))
       movePending.set(id, position)
 
       if (moveInFlight.has(id)) return
@@ -569,6 +729,46 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
         }
       } finally {
         moveInFlight.delete(id)
+      }
+    },
+
+    /**
+     * Feature 11 — one-click tidy. Computes the barycentre-ordered layout,
+     * applies it optimistically (the canvas animates node transforms while
+     * `layoutAnimating` is true), and persists the WHOLE layout in one
+     * `POST /api/entities/move-batch`. Both the canvas button and the TopBar
+     * button call this same action; the canvas re-fits the view when
+     * `layoutEpoch` bumps.
+     */
+    async applyAutoLayout() {
+      const positions = autoLayout(get().state)
+      const ids = Object.keys(positions)
+      if (ids.length === 0) return
+
+      // Pin every id so the simulator's 250ms patches (which still carry the
+      // old positions) cannot snap cards back mid-animation.
+      for (const id of ids) movePending.set(id, positions[id])
+
+      set((prev) => ({
+        state: withPositions(prev.state, positions),
+        layoutAnimating: true,
+        layoutEpoch: prev.layoutEpoch + 1,
+      }))
+      if (layoutAnimTimer !== null) window.clearTimeout(layoutAnimTimer)
+      layoutAnimTimer = window.setTimeout(() => {
+        layoutAnimTimer = null
+        set({ layoutAnimating: false })
+      }, LAYOUT_ANIM_MS)
+
+      try {
+        await api.moveBatch(ids.map((id) => ({ id, position: positions[id] })))
+        pushLog('info', '已自动整理画布布局')
+      } catch (error) {
+        fail('自动布局', error)
+      } finally {
+        for (const id of ids) {
+          if (movePending.get(id) === positions[id]) movePending.delete(id)
+        }
       }
     },
 
@@ -617,6 +817,8 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
           traces: [],
           nodeActivity: {},
           edgeActivity: {},
+          edgeMetrics: indexEdges(data.edges),
+          notices: [],
           activeTraceId: null,
           selectedId: null,
           ready: true,
@@ -633,6 +835,20 @@ export const useConsole = create<ConsoleStore>()((set, get) => {
 
 export function useEntity(id: string | null | undefined): Entity | undefined {
   return useConsole((s) => (id ? findEntity(s.state, id) : undefined))
+}
+
+/** Id -> entity map over the whole graph, gateway included. */
+export function useEntityMap(): Map<string, Entity> {
+  const state = useConsole((s) => s.state)
+  return useMemo(() => {
+    const map = new Map<string, Entity>()
+    if (state.gateway?.id) map.set(state.gateway.id, state.gateway)
+    for (const entity of state.keys) map.set(entity.id, entity)
+    for (const entity of state.pools) map.set(entity.id, entity)
+    for (const entity of state.accounts) map.set(entity.id, entity)
+    for (const entity of state.proxies) map.set(entity.id, entity)
+    return map
+  }, [state])
 }
 
 export function useNodePulse(id: string): number {
@@ -652,16 +868,23 @@ export function useEdgeVolume(id: string): number {
   return useConsole((s) => s.edgeActivity[id]?.burst ?? 1)
 }
 
-/** Rolling share of this edge's traffic against the busiest edge on the board. */
-export function useEdgeLoad(id: string): number {
+/**
+ * Rolling metrics of one relation. Returns the STORED object reference —
+ * never build a fresh object inside a zustand v5 selector, it would loop.
+ */
+export function useEdgeMetrics(id: string): EdgeMetrics | undefined {
+  return useConsole((s) => s.edgeMetrics[id])
+}
+
+/** Highest rolling rpm on the board, for throughput-relative stroke widths. */
+export function useEdgeMaxRpm(): number {
   return useConsole((s) => {
-    const mine = s.edgeActivity[id]?.count ?? 0
-    if (mine === 0) return 0
-    let max = 1
-    for (const activity of Object.values(s.edgeActivity)) {
-      if (activity.count > max) max = activity.count
+    let max = 0
+    for (const id in s.edgeMetrics) {
+      const rpm = s.edgeMetrics[id].rpm
+      if (rpm > max) max = rpm
     }
-    return mine / max
+    return max
   })
 }
 

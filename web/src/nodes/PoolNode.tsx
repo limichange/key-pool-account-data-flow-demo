@@ -2,12 +2,14 @@ import { memo, useMemo } from 'react'
 import type { NodeProps } from '@xyflow/react'
 import { Layers, Pin, Repeat, ShieldAlert, ShieldOff } from 'lucide-react'
 import {
+  ACCOUNT_TYPE_LABEL_CN,
   formatMs,
   formatNumber,
   isServing,
   percent,
   successRate,
   type AccountEntity,
+  type AccountType,
   type HealthStatus,
   type PoolEntity,
   type PoolMember,
@@ -21,11 +23,20 @@ import { NodeShell, nodeInnerWidth } from './NodeShell'
 
 const VISIBLE_MEMBERS = 4
 
+/** Short mono codes so the plan mix inside a pool stays legible at 11px. */
+const TYPE_CODE: Record<AccountType, string> = {
+  k12: 'K12',
+  plus: 'PLUS',
+  pro: 'PRO',
+  prolite: 'LITE',
+}
+
 interface ResolvedMember {
   member: PoolMember
   name: string
   status: HealthStatus
   serving: boolean
+  accountType: AccountType | null
 }
 
 function rateTone(rate: number): 'default' | 'ok' | 'warn' | 'danger' {
@@ -56,6 +67,7 @@ export const PoolNode = memo(function PoolNode({ data, selected }: NodeProps<Kpa
         name: typed ? typed.name : member.accountId,
         status,
         serving: Boolean(typed) && member.enabled && isServing(status),
+        accountType: typed ? typed.accountType : null,
       }
     })
   }, [accounts, entity.members])
@@ -74,6 +86,7 @@ export const PoolNode = memo(function PoolNode({ data, selected }: NodeProps<Kpa
       selected={selected}
       dimmed={data.dimmed}
       traced={data.traced}
+      detached={Boolean(data.detached)}
       handles="in-out"
       icon={<Layers size={14} />}
       subtitle={<span className="kpa-node__mono">{entity.id}</span>}
@@ -151,10 +164,21 @@ export const PoolNode = memo(function PoolNode({ data, selected }: NodeProps<Kpa
                 className="kpa-member"
                 data-status={row.status}
                 data-off={row.member.enabled ? undefined : 'true'}
-                title={`${row.name} · 权重 ${row.member.weight} · 优先级 ${row.member.priority}`}
+                title={`${row.name}${
+                  row.accountType ? ` · ${ACCOUNT_TYPE_LABEL_CN[row.accountType]}` : ''
+                } · 权重 ${row.member.weight} · 优先级 ${row.member.priority}`}
               >
                 <StatusDot status={row.status} size={6} />
                 <span className="kpa-member__name">{row.name}</span>
+                {row.accountType ? (
+                  <span
+                    className="kpa-type-badge kpa-member__type"
+                    data-type={row.accountType}
+                    title={ACCOUNT_TYPE_LABEL_CN[row.accountType]}
+                  >
+                    {TYPE_CODE[row.accountType]}
+                  </span>
+                ) : null}
                 <span className="kpa-member__bar">
                   <span className="kpa-member__bar-fill" style={{ width: `${share}%` }} />
                 </span>

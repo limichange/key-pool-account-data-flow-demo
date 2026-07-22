@@ -1,10 +1,10 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowUp, ChevronDown, ChevronUp, Eraser, Inbox, Radio, RotateCw } from 'lucide-react'
-import { formatClock, formatMs, formatNumber } from '@kpa/shared'
+import { ACCOUNT_TYPE_LABEL_CN, formatClock, formatMs, formatNumber } from '@kpa/shared'
 import type { EntityKind, RequestOutcome, RequestTrace } from '@kpa/shared'
 
 import { Badge, Button, Empty, IconButton, Stat } from '@/components'
-import { kindIcon, outcomeLabel, outcomeTone } from '@/lib/format'
+import { countryFlag, kindIcon, outcomeLabel, outcomeTone } from '@/lib/format'
 import { useConsole } from '@/lib/store'
 import { EventLog } from './EventLog'
 
@@ -14,17 +14,53 @@ interface Crumb {
   kind: EntityKind
   name: string
   ok: boolean
+  /** Tooltip enrichment (account plan type, proxy geo). Falls back to `name`. */
+  title?: string
+}
+
+/**
+ * Non-reactive graph lookups for crumb enrichment. Traces are immutable and a
+ * tooltip does not need live updates, so a `getState()` read at memo time is
+ * enough — no per-row store subscription, no rebuilt entity map per flush.
+ */
+function accountMeta(id: string): string | null {
+  const account = useConsole.getState().state.accounts.find((a) => a.id === id)
+  return account ? ACCOUNT_TYPE_LABEL_CN[account.accountType] : null
+}
+
+function proxyMeta(id: string): { flag: string; country: string; ip: string } | null {
+  const proxy = useConsole.getState().state.proxies.find((p) => p.id === id)
+  return proxy ? { flag: countryFlag(proxy.countryCode), country: proxy.country, ip: proxy.ip } : null
 }
 
 /**
  * Crumbs come from the trace alone. `trace.path` is populated on every route,
- * so the id-resolving fallback only has to cover the degenerate case, and this
- * component no longer needs a map of every entity in the graph — which used to
- * be rebuilt for all 60 rows on every 100ms trace flush.
+ * so the id-resolving fallback only has to cover the degenerate case. Account
+ * crumbs carry the plan type in their tooltip (feature 7); proxy crumbs show
+ * flag + country (feature 8).
  */
 function buildCrumbs(trace: RequestTrace): Crumb[] {
+  const enrich = (kind: EntityKind, id: string | null, name: string, ok: boolean): Crumb => {
+    if (kind === 'account' && id) {
+      const type = accountMeta(id)
+      return { kind, name, ok, title: type ? `${name} · ${type}` : undefined }
+    }
+    if (kind === 'proxy' && id) {
+      const meta = proxyMeta(id)
+      if (meta) {
+        return {
+          kind,
+          name: `${meta.flag} ${name}`,
+          ok,
+          title: `${name} · ${meta.country} · ${meta.ip}`,
+        }
+      }
+    }
+    return { kind, name, ok }
+  }
+
   if (trace.path.length > 0) {
-    return trace.path.map((hop) => ({ kind: hop.kind, name: hop.name, ok: hop.ok }))
+    return trace.path.map((hop) => enrich(hop.kind, hop.id, hop.name, hop.ok))
   }
   const crumbs: Crumb[] = [{ kind: 'key', name: trace.keyName, ok: trace.ok }]
   const tail: { kind: EntityKind; id: string | null }[] = [
@@ -34,7 +70,7 @@ function buildCrumbs(trace: RequestTrace): Crumb[] {
   ]
   for (const item of tail) {
     if (!item.id) continue
-    crumbs.push({ kind: item.kind, name: item.id, ok: trace.ok })
+    crumbs.push(enrich(item.kind, item.id, item.id, trace.ok))
   }
   return crumbs
 }
@@ -50,7 +86,7 @@ const Crumbs = memo(function Crumbs({ crumbs }: { crumbs: Crumb[] }): JSX.Elemen
           data-ok={crumb.ok ? 'true' : 'false'}
           data-last={i === last ? 'true' : undefined}
           key={`${crumb.kind}-${i}`}
-          title={crumb.name}
+          title={crumb.title ?? crumb.name}
         >
           {i > 0 ? <i className="kpa-tl-arrow">›</i> : null}
           <span className="kpa-tl-crumb-name">{crumb.name}</span>
@@ -142,6 +178,8 @@ function TraceDetail({
       <ol className="kpa-tl-timeline">
         {trace.path.map((hop, i) => {
           const Icon = kindIcon(hop.kind)
+          const geo = hop.kind === 'proxy' ? proxyMeta(hop.id) : null
+          const type = hop.kind === 'account' ? accountMeta(hop.id) : null
           return (
             <li
               className="kpa-tl-hop"
@@ -153,7 +191,15 @@ function TraceDetail({
                 <Icon size={11} />
               </span>
               <span className="kpa-tl-hop-body">
-                <span className="kpa-tl-hop-name">{hop.name}</span>
+                <span className="kpa-tl-hop-name">
+                  {hop.name}
+                  {geo ? (
+                    <span className="kpa-tl-hop-geo" title={`${geo.country} · 出口 IP ${geo.ip}`}>
+                      {geo.flag} {geo.country}
+                    </span>
+                  ) : null}
+                  {type ? <span className="kpa-tl-hop-geo">{type}</span> : null}
+                </span>
                 <span className="kpa-tl-hop-reason">{hop.reason}</span>
               </span>
               <span className="kpa-tl-hop-latency">{formatMs(hop.latencyMs)}</span>

@@ -20,6 +20,7 @@ import {
   type XY,
 } from '@kpa/shared'
 
+import { EdgeMetricsStore } from './edges.js'
 import { Simulator } from './simulator.js'
 import { GraphStore } from './store.js'
 
@@ -52,13 +53,26 @@ function broadcast(event: ServerEvent): void {
 }
 
 const store = new GraphStore()
+const edgeStore = new EdgeMetricsStore()
 // Re-parenting an account (bind pool -> account when another pool owned it) has
 // to be visible to the operator, so the store gets a channel onto the log panel.
 store.setLogSink((level, message) => broadcast({ type: 'log', level, message, at: Date.now() }))
-const simulator = new Simulator(store, broadcast)
+// Cascades (e.g. proxy disable auto-disabling its in-pool accounts) raise a
+// user-facing dialog on every console — even when the mutation came in through
+// the REST API — and also land on the operator log so nothing is lost.
+store.setNoticeSink((notice) => {
+  const at = Date.now()
+  broadcast({ type: 'notice', ...notice, at })
+  broadcast({ type: 'log', level: notice.level, message: `${notice.title}：${notice.message}`, at })
+})
+const simulator = new Simulator(store, edgeStore, broadcast)
 
 /** Push everything the last mutation touched to every console. */
 function flushPatches(): void {
+  // Relations may have changed: reconcile the per-edge metric set and tell the
+  // clients which edge metrics died with the relation.
+  const removedEdgeIds = edgeStore.sync(store.snapshot())
+  if (removedEdgeIds.length > 0) broadcast({ type: 'removed', ids: [], edgeIds: removedEdgeIds })
   const entities = store.drainDirty()
   if (entities.length > 0) broadcast({ type: 'patch', entities })
 }
@@ -131,7 +145,40 @@ const api = express.Router()
 api.get(
   '/state',
   route((_req, res) => {
-    res.json({ state: store.snapshot(), config: simulator.getConfig(), stats: simulator.getStats() })
+    res.json({
+      state: store.snapshot(),
+      config: simulator.getConfig(),
+      stats: simulator.getStats(),
+      edges: edgeStore.list(),
+    })
+  }),
+)
+
+// Registered BEFORE `/entities/:kind` or Express would treat "move-batch" as a
+// kind. Persists a whole layout (自动布局) in ONE request instead of one per node.
+api.post(
+  '/entities/move-batch',
+  route((req, res) => {
+    const payload = body(req)
+    if (!Array.isArray(payload.moves)) throw new HttpError(400, 'moves 必须是数组')
+    const moves = payload.moves.map((raw, index) => {
+      if (typeof raw !== 'object' || raw === null) {
+        throw new HttpError(400, `moves[${index}] 必须是 { id, position } 对象`)
+      }
+      const move = raw as Record<string, unknown>
+      const id = typeof move.id === 'string' ? move.id : ''
+      if (!id) throw new HttpError(400, `moves[${index}].id 缺失`)
+      return { id, position: parsePosition(move.position) }
+    })
+    let moved = 0
+    for (const move of moves) {
+      // A node deleted while the layout was computing is skipped, not fatal.
+      if (!store.get(move.id)) continue
+      store.move(move.id, move.position)
+      moved += 1
+    }
+    flushPatches()
+    res.json({ ok: true, moved })
   }),
 )
 
@@ -167,7 +214,14 @@ api.delete(
     // The store has no hook into the simulator, so its per-entity bookkeeping
     // has to be released here or it leaks for the life of the process.
     simulator.forget(id)
-    broadcast({ type: 'removed', ids: [id] })
+    // One `removed` event carrying both the entity and every edge metric that
+    // died with its relations.
+    const removedEdgeIds = edgeStore.sync(store.snapshot())
+    broadcast({
+      type: 'removed',
+      ids: [id],
+      ...(removedEdgeIds.length > 0 ? { edgeIds: removedEdgeIds } : {}),
+    })
     flushPatches()
     res.json({ ok: true })
   }),
@@ -235,7 +289,12 @@ api.post(
   '/reset',
   route((_req, res) => {
     simulator.reset()
-    res.json({ state: store.snapshot(), config: simulator.getConfig(), stats: simulator.getStats() })
+    res.json({
+      state: store.snapshot(),
+      config: simulator.getConfig(),
+      stats: simulator.getStats(),
+      edges: edgeStore.list(),
+    })
   }),
 )
 
@@ -279,6 +338,7 @@ wss.on('connection', (socket: WebSocket) => {
         state: store.snapshot(),
         config: simulator.getConfig(),
         stats: simulator.getStats(),
+        edges: edgeStore.list(),
       } satisfies ServerEvent),
     )
   } catch {
@@ -315,7 +375,7 @@ server.listen(PORT, HOST, () => {
     '  └──────────────────────────────────────────────┘',
     `  REST      http://${HOST}:${PORT}${API_PREFIX}`,
     `  WebSocket ws://${HOST}:${PORT}${WS_PATH}`,
-    `  拓扑      ${state.keys.length} keys · ${state.pools.length} pools · ${state.accounts.length} accounts · ${state.proxies.length} proxies`,
+    `  拓扑      1 gateway · ${state.keys.length} keys · ${state.pools.length} pools · ${state.accounts.length} accounts · ${state.proxies.length} proxies`,
     `  模拟器    running=${simulator.getConfig().running} rps=${simulator.getConfig().rps}`,
     '',
   ]

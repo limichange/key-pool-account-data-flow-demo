@@ -11,19 +11,25 @@
  * function — `syncAccountPoolRefs()` — after every mutating path.
  */
 import {
+  ACCOUNT_TYPES,
+  ACCOUNT_TYPE_PRESETS,
+  DEFAULT_KEY_RPM,
   LAYOUT,
   MODELS,
   PROVIDERS,
   PROXY_PROTOCOLS,
   ROUTING_STRATEGIES,
+  canJoinPool,
   createMetrics,
   isServing,
   kindCounts,
   layoutSlotFor,
   type AccountEntity,
+  type AccountType,
   type CredentialType,
   type Entity,
   type EntityKind,
+  type GatewayEntity,
   type GraphState,
   type HealthStatus,
   type KeyEntity,
@@ -56,6 +62,20 @@ export interface EntityRef {
 /** Operator-visible log line emitted by a store mutation. */
 export type StoreLogLevel = 'info' | 'warn' | 'error'
 export type StoreLogSink = (level: StoreLogLevel, message: string) => void
+
+/**
+ * User-facing announcement a store mutation raises (dialog-worthy, unlike a
+ * log line) — e.g. the proxy-disable cascade. The HTTP layer forwards it as a
+ * `notice` ServerEvent, so it fires even when the mutation came in through the
+ * REST API rather than the UI.
+ */
+export interface StoreNotice {
+  level: StoreLogLevel
+  title: string
+  message: string
+  entityIds: string[]
+}
+export type StoreNoticeSink = (notice: StoreNotice) => void
 
 /** Dev-only invariant checks; a broken invariant warns, it never throws. */
 const CHECK_INVARIANTS = process.env.NODE_ENV !== 'production'
@@ -127,6 +147,8 @@ export class GraphStore {
   private recentError = new Map<string, number>()
   /** Set by the HTTP layer so re-parenting is announced on the operator log. */
   private logSink: StoreLogSink | null = null
+  /** Set by the HTTP layer so cascades raise a user-facing `notice` dialog. */
+  private noticeSink: StoreNoticeSink | null = null
 
   constructor(state: GraphState = createSeedState()) {
     this.state = state
@@ -142,8 +164,17 @@ export class GraphStore {
     this.logSink = sink
   }
 
+  /** Route store-level user-facing notices to the websocket broadcast. */
+  setNoticeSink(sink: StoreNoticeSink | null): void {
+    this.noticeSink = sink
+  }
+
   private log(level: StoreLogLevel, message: string): void {
     this.logSink?.(level, message)
+  }
+
+  private notice(level: StoreLogLevel, title: string, message: string, entityIds: string[]): void {
+    this.noticeSink?.({ level, title, message, entityIds })
   }
 
   /* ------------------------------------------------------------ reading -- */
@@ -165,6 +196,11 @@ export class GraphStore {
 
   get(id: string): Entity | undefined {
     return this.index.get(id)
+  }
+
+  /** The singleton entry node — always present, never created or deleted. */
+  getGateway(): GatewayEntity {
+    return this.state.gateway
   }
 
   getKey(id: string | null | undefined): KeyEntity | undefined {
@@ -204,7 +240,13 @@ export class GraphStore {
   }
 
   all(): Entity[] {
-    return [...this.state.keys, ...this.state.pools, ...this.state.accounts, ...this.state.proxies]
+    return [
+      this.state.gateway,
+      ...this.state.keys,
+      ...this.state.pools,
+      ...this.state.accounts,
+      ...this.state.proxies,
+    ]
   }
 
   /* ------------------------------------------------------------ dirtying -- */
@@ -239,6 +281,15 @@ export class GraphStore {
 
   recomputeStatus(entity: Entity, now: number = Date.now()): HealthStatus {
     if (!entity.enabled) return 'disabled'
+
+    // The gateway only knows three states: disabled (the console-wide kill
+    // switch), throttled (its own global rpm ceiling) and healthy.
+    if (entity.kind === 'gateway') {
+      if (entity.rateLimit.rpm > 0 && entity.metrics.rpm >= entity.rateLimit.rpm) {
+        return 'throttled'
+      }
+      return 'healthy'
+    }
 
     if (entity.kind === 'proxy' && !entity.health.alive) return 'offline'
 
@@ -286,7 +337,7 @@ export class GraphStore {
 
   /**
    * Recompute every status. Order matters: proxies feed accounts, accounts feed
-   * pools and pools feed keys.
+   * pools, pools feed keys and the gateway sits in front of everything.
    */
   refreshStatuses(now: number = Date.now()): void {
     const ordered: Entity[] = [
@@ -294,6 +345,7 @@ export class GraphStore {
       ...this.state.accounts,
       ...this.state.pools,
       ...this.state.keys,
+      this.state.gateway,
     ]
     for (const entity of ordered) {
       const next = this.recomputeStatus(entity, now)
@@ -337,13 +389,25 @@ export class GraphStore {
    * remove, bind, unbind, replace/reset and the constructor (seed).
    */
   private syncAccountPoolRefs(now: number = Date.now()): void {
-    // 1. per-pool cleanup: dangling members and in-pool duplicates.
+    // 1. per-pool cleanup: dangling members, in-pool duplicates and — the
+    //    egress-before-serve rule — members whose account has NO proxy. The
+    //    last one is what turns "delete a proxy" into a cascade: the accounts
+    //    lose their proxyId in `remove()` and fall out of their pool right
+    //    here, becoming 未接入.
     for (const pool of this.state.pools) {
       const seen = new Set<string>()
       const kept: PoolMember[] = []
       for (const member of pool.members) {
         if (seen.has(member.accountId)) continue
-        if (!this.getAccount(member.accountId)) continue
+        const account = this.getAccount(member.accountId)
+        if (!account) continue
+        if (!canJoinPool(account)) {
+          this.log(
+            'warn',
+            `账号「${account.name}」未绑定出口代理，已从池「${pool.name}」移除（变为未接入）`,
+          )
+          continue
+        }
         seen.add(member.accountId)
         kept.push(member)
       }
@@ -380,6 +444,10 @@ export class GraphStore {
       const next = owner.get(account.id)?.id ?? null
       if (account.poolId !== next) {
         account.poolId = next
+        // Leaving the pool clears the proxy-cascade marker: a detached
+        // account's enabled switch is fully operator-owned again, so a later
+        // proxy re-enable can never resurrect it.
+        if (next === null && account.autoDisabledBy !== null) account.autoDisabledBy = null
         account.updatedAt = now
         this.markDirty(account)
       }
@@ -443,6 +511,60 @@ export class GraphStore {
   }
 
   /**
+   * The proxy ENABLE switch cascades to the in-pool accounts behind it: the
+   * egress rule says an in-pool account must have a working proxy, so the
+   * moment its proxy is switched OFF the account can no longer serve and is
+   * taken out of rotation instead of silently failing every request.
+   *
+   * Driven ONLY by `proxy.enabled` — a proxy that merely goes unhealthy
+   * (`health.alive === false`) is already handled by the router skipping it
+   * and must NOT disable anything.
+   *
+   * `autoDisabledBy` records the causality precisely, so re-enabling the proxy
+   * only resurrects the accounts THIS cascade switched off — never one the
+   * operator disabled by hand. Accounts outside any pool are left alone
+   * (nothing to protect).
+   */
+  private cascadeProxyEnabled(proxy: ProxyEntity, now: number): void {
+    if (!proxy.enabled) {
+      const affected = this.state.accounts.filter(
+        (account) => account.proxyId === proxy.id && account.poolId !== null && account.enabled,
+      )
+      if (affected.length === 0) return
+      for (const account of affected) {
+        account.enabled = false
+        account.autoDisabledBy = proxy.id
+        account.updatedAt = now
+        this.markDirty(account)
+      }
+      const names = affected.map((account) => account.name).join('、')
+      this.notice(
+        'warn',
+        '代理停用 · 账号联动停用',
+        `停用代理「${proxy.name}」已同时自动停用正在使用它的 ${affected.length} 个池内账号：${names}。重新启用该代理后这些账号会自动恢复。`,
+        [proxy.id, ...affected.map((account) => account.id)],
+      )
+      return
+    }
+
+    const restored = this.state.accounts.filter((account) => account.autoDisabledBy === proxy.id)
+    if (restored.length === 0) return
+    for (const account of restored) {
+      account.enabled = true
+      account.autoDisabledBy = null
+      account.updatedAt = now
+      this.markDirty(account)
+    }
+    const names = restored.map((account) => account.name).join('、')
+    this.notice(
+      'info',
+      '代理恢复 · 账号联动恢复',
+      `代理「${proxy.name}」已重新启用，之前被联动停用的 ${restored.length} 个账号已自动恢复：${names}。`,
+      [proxy.id, ...restored.map((account) => account.id)],
+    )
+  }
+
+  /**
    * Cheap dev-time guard. Warns — never throws — when the one-pool-per-account
    * invariant or its derived back-reference got out of sync after a mutation.
    */
@@ -484,6 +606,11 @@ export class GraphStore {
   /* ---------------------------------------------------------- mutations -- */
 
   create(kind: EntityKind, draft: Record<string, unknown> = {}): Entity {
+    // The gateway is a SINGLETON: exactly one exists for the life of the
+    // console, so creating another is a client error, never a merge.
+    if (kind === 'gateway') {
+      throw new Error('网关是系统内置的唯一入口节点，不能创建新的网关')
+    }
     const now = Date.now()
     const entity = this.buildDefault(kind, now)
     this.applyPatch(entity, draft, now)
@@ -509,7 +636,13 @@ export class GraphStore {
     if (!entity) throw new Error(`实体不存在: ${id}`)
     if (entity.kind !== kind) throw new Error(`实体 ${id} 的类型是 ${entity.kind}，不是 ${kind}`)
     const now = Date.now()
+    const enabledBefore = entity.enabled
     this.applyPatch(entity, patch, now)
+    // The proxy ENABLE switch cascades to the in-pool accounts behind it.
+    // Keyed off the `enabled` transition ONLY — see `cascadeProxyEnabled`.
+    if (entity.kind === 'proxy' && entity.enabled !== enabledBefore) {
+      this.cascadeProxyEnabled(entity, now)
+    }
     // A `members` patch is a re-parenting operation: every account it now lists
     // leaves whatever pool used to own it (Pool -> Account is one-to-many).
     // Member rows are validated in `parseMembers` (weight/priority coerced) and
@@ -526,6 +659,10 @@ export class GraphStore {
   }
 
   remove(kind: EntityKind, id: string): void {
+    // The gateway can never be deleted — it is the root of the whole graph.
+    if (kind === 'gateway') {
+      throw new Error('网关是系统内置的唯一入口节点，不能删除（可通过停用来切断流量）')
+    }
     const entity = this.index.get(id)
     if (!entity) throw new Error(`实体不存在: ${id}`)
     if (entity.kind !== kind) throw new Error(`实体 ${id} 的类型是 ${entity.kind}，不是 ${kind}`)
@@ -563,10 +700,14 @@ export class GraphStore {
         break
       }
       case 'proxy': {
+        // CASCADE (egress-before-serve): every account using this proxy loses
+        // its egress AND therefore its pool seat — `syncAccountPoolRefs` below
+        // drops the now proxy-less members, turning those accounts 未接入.
         this.state.proxies = this.state.proxies.filter((item) => item.id !== id)
         for (const account of this.state.accounts) {
           if (account.proxyId === id) {
             account.proxyId = null
+            if (account.autoDisabledBy === id) account.autoDisabledBy = null
             account.updatedAt = now
             this.markDirty(account)
           }
@@ -615,6 +756,15 @@ export class GraphStore {
         const { pool, account } = relation
         if (pool.members.some((member) => member.accountId === account.id)) return
 
+        // Egress-before-serve: an account may only join a pool once its exit
+        // proxy is configured. This is an ORDERING rule, enforced on every
+        // path that can add a member.
+        if (!canJoinPool(account)) {
+          throw new Error(
+            `账号「${account.name}」尚未绑定代理，请先绑定出口代理后再加入池`,
+          )
+        }
+
         // Pool -> Account is ONE-TO-MANY: an account belongs to at most one
         // pool, so binding an account that another pool already owns is a MOVE
         // (re-parenting), never an error. Dragging an edge from a pool onto an
@@ -647,7 +797,11 @@ export class GraphStore {
       case 'account-proxy': {
         const { account, proxy } = relation
         if (account.proxyId === proxy.id) return
+        // Binding a different proxy REPLACES the old one — this is how egress
+        // is swapped without touching pool membership. Causality of a previous
+        // proxy-disable cascade no longer applies, so the marker is cleared.
         account.proxyId = proxy.id
+        if (account.autoDisabledBy !== null) account.autoDisabledBy = null
         account.updatedAt = now
         this.markDirty(account)
         break
@@ -688,7 +842,20 @@ export class GraphStore {
       case 'account-proxy': {
         const { account, proxy } = relation
         if (account.proxyId !== proxy.id) return
+        // Egress-before-serve: while the account sits in a pool its proxy may
+        // be REPLACED (bind a different one) but never removed — otherwise the
+        // pool would hold a member that cannot exit. Parked accounts unbind
+        // freely.
+        const owner = this.state.pools.find((pool) =>
+          pool.members.some((member) => member.accountId === account.id),
+        )
+        if (owner) {
+          throw new Error(
+            `账号「${account.name}」仍在池「${owner.name}」中，不能解绑代理；请先将其移出池，或直接改绑其他代理`,
+          )
+        }
         account.proxyId = null
+        if (account.autoDisabledBy !== null) account.autoDisabledBy = null
         account.updatedAt = now
         this.markDirty(account)
         break
@@ -696,7 +863,9 @@ export class GraphStore {
     }
 
     // Unbinding pool -> account leaves the account unassigned (poolId null),
-    // which is a legal, meaningful state (未分配).
+    // which is a legal, meaningful state (未接入 / 未分配). Unbinding the LAST
+    // upstream relation of a pool / account / proxy is equally legal — the
+    // node simply becomes detached (游离) and receives no traffic.
     this.syncAccountPoolRefs(now)
     this.syncKeyBindingRefs(now)
     this.state.updatedAt = now
@@ -728,7 +897,7 @@ export class GraphStore {
     }
 
     throw new Error(
-      `非法连接: ${from.kind} -> ${to.kind}，仅支持 密钥→池 / 池→账号 / 账号→代理`,
+      `非法连接: ${from.kind} -> ${to.kind}，仅支持 密钥→池 / 池→账号 / 账号→代理（网关→密钥 为系统内置连线，不可编辑）`,
     )
   }
 
@@ -741,6 +910,9 @@ export class GraphStore {
 
   private listOf(kind: EntityKind): Entity[] {
     switch (kind) {
+      case 'gateway':
+        // Unreachable: `create` rejects the kind before ever getting here.
+        throw new Error('网关是单例节点，不属于任何实体列表')
       case 'key':
         return this.state.keys as Entity[]
       case 'pool':
@@ -788,7 +960,14 @@ export class GraphStore {
   }
 
   private freshId(kind: EntityKind): string {
-    const prefix = kind === 'key' ? 'key' : kind === 'pool' ? 'pool' : kind === 'account' ? 'acc' : 'px'
+    const prefixes: Record<EntityKind, string> = {
+      gateway: 'gw',
+      key: 'key',
+      pool: 'pool',
+      account: 'acc',
+      proxy: 'px',
+    }
+    const prefix = prefixes[kind]
     let id = rng.shortId(prefix)
     while (this.index.has(id)) id = rng.shortId(prefix)
     return id
@@ -810,6 +989,9 @@ export class GraphStore {
     }
 
     switch (kind) {
+      case 'gateway':
+        // Unreachable: `create` rejects the kind before ever getting here.
+        throw new Error('网关是系统内置的唯一入口节点，不能创建新的网关')
       case 'key':
         return {
           ...base,
@@ -818,7 +1000,8 @@ export class GraphStore {
           secret: `sk-limi-live-****${maskedTail()}`,
           owner: '未指派',
           tier: 'pro',
-          rateLimit: { rpm: 120, concurrency: 16 },
+          // Every newly created key starts at DEFAULT_KEY_RPM 次/分钟.
+          rateLimit: { rpm: DEFAULT_KEY_RPM, concurrency: 16 },
           quota: { limitTokens: 2_000_000, usedTokens: 0, resetAt: now + HOUR },
           bindings: [],
           allowedModels: [],
@@ -838,7 +1021,12 @@ export class GraphStore {
           failoverPoolId: null,
           cursor: 0,
         }
-      case 'account':
+      case 'account': {
+        // A new account starts as the default plan type; the plan PRESETS seed
+        // its rateLimit / quota / models. A draft `accountType` (and any
+        // explicit rateLimit/quota/models) is applied on top by `applyPatch`.
+        const accountType: AccountType = 'plus'
+        const preset = ACCOUNT_TYPE_PRESETS[accountType]
         return {
           ...base,
           kind: 'account',
@@ -848,12 +1036,16 @@ export class GraphStore {
           // only writer of this field afterwards.
           poolId: null,
           provider: 'anthropic',
+          accountType,
           credentialType: 'api-key',
           credentialMask: `sk-ant-api03-****${maskedTail()}`,
           region: 'us-west-2',
+          // No proxy yet: the account is PARKED (未配置代理) and cannot join a
+          // pool until an egress proxy is bound (egress-before-serve).
           proxyId: null,
-          rateLimit: { rpm: 120, concurrency: 16 },
-          quota: { limitTokens: 5_000_000, usedTokens: 0, resetAt: now + HOUR },
+          autoDisabledBy: null,
+          rateLimit: { ...preset.rateLimit },
+          quota: { limitTokens: preset.quotaTokens, usedTokens: 0, resetAt: now + HOUR },
           health: {
             latencyMs: 900,
             errorRate: 0,
@@ -864,18 +1056,23 @@ export class GraphStore {
           },
           reliability: 0.98,
           baseLatencyMs: 900,
-          models: [MODELS[2]],
+          models: [...preset.models],
         }
+      }
       case 'proxy':
         return {
           ...base,
           kind: 'proxy',
           name: '新建代理',
           protocol: 'https',
+          // `host`/`port` is the endpoint you DIAL; `ip`/`country` is the
+          // egress the upstream SEES. They are deliberately different fields.
           host: 'new.egress.limi.net',
           port: 8443,
           region: 'us-west-2',
           countryCode: 'US',
+          ip: '198.51.100.24',
+          country: '美国',
           poolType: 'datacenter',
           maxConcurrency: 64,
           health: { latencyMs: 120, alive: true, packetLoss: 0.005, lastCheckAt: now },
@@ -901,13 +1098,30 @@ export class GraphStore {
     entity.tags = has('tags') ? toStrArray(patch.tags, entity.tags) : entity.tags
     if (has('position')) entity.position = toXY(patch.position, entity.position)
 
-    if (entity.kind === 'key' || entity.kind === 'account') {
+    // Switching the plan type re-baselines rateLimit / quota / models to the
+    // type PRESETS. Runs BEFORE the generic rateLimit/quota merge below so an
+    // explicit rateLimit/quota/models in the same patch still wins. The type
+    // itself never scales anything at runtime — presets are defaults only.
+    if (entity.kind === 'account' && has('accountType')) {
+      const nextType = toEnum<AccountType>(patch.accountType, ACCOUNT_TYPES, entity.accountType)
+      if (nextType !== entity.accountType) {
+        const preset = ACCOUNT_TYPE_PRESETS[nextType]
+        entity.accountType = nextType
+        entity.rateLimit = { ...preset.rateLimit }
+        entity.quota = { ...entity.quota, limitTokens: preset.quotaTokens }
+        entity.models = [...preset.models]
+      }
+    }
+
+    if (entity.kind === 'key' || entity.kind === 'account' || entity.kind === 'gateway') {
       if (isRecord(patch.rateLimit)) {
         entity.rateLimit = {
           rpm: Math.max(0, toNum(patch.rateLimit.rpm, entity.rateLimit.rpm)),
           concurrency: Math.max(0, toNum(patch.rateLimit.concurrency, entity.rateLimit.concurrency)),
         }
       }
+    }
+    if (entity.kind === 'key' || entity.kind === 'account') {
       if (isRecord(patch.quota)) {
         entity.quota = {
           limitTokens: Math.max(0, toNum(patch.quota.limitTokens, entity.quota.limitTokens)),
@@ -918,6 +1132,13 @@ export class GraphStore {
     }
 
     switch (entity.kind) {
+      case 'gateway': {
+        // Singleton: name/enabled/rateLimit/note/tags/position handled above,
+        // plus the public endpoint and the build string. Nothing else moves.
+        entity.endpoint = S('endpoint', entity.endpoint)
+        entity.version = S('version', entity.version)
+        break
+      }
       case 'key': {
         entity.secret = S('secret', entity.secret)
         entity.owner = S('owner', entity.owner)
@@ -960,7 +1181,22 @@ export class GraphStore {
           const next = toNullableStr(patch.failoverPoolId, entity.failoverPoolId)
           entity.failoverPoolId = next === entity.id ? null : next
         }
-        if (has('members')) entity.members = parseMembers(patch.members, entity.members)
+        if (has('members')) {
+          // Egress-before-serve: a members patch containing a proxy-less
+          // account DROPS that member with a warn log rather than corrupting
+          // the graph. Unknown accountIds are handled by `syncAccountPoolRefs`.
+          entity.members = parseMembers(patch.members, entity.members).filter((member) => {
+            const account = this.getAccount(member.accountId)
+            if (account && !canJoinPool(account)) {
+              this.log(
+                'warn',
+                `账号「${account.name}」尚未绑定代理，已从池「${entity.name}」的成员列表中忽略`,
+              )
+              return false
+            }
+            return true
+          })
+        }
         // Single-row merge, same reasoning as `binding` above.
         if (isRecord(patch.member)) {
           const row = patch.member
@@ -986,6 +1222,12 @@ export class GraphStore {
         // `members` patch, and only `syncAccountPoolRefs` writes this field.
         // Accepting it here would let a client desync the derived reference from
         // the authoritative member lists.
+        //
+        // `autoDisabledBy` is SERVER-OWNED and equally not patchable: only the
+        // proxy-disable cascade writes it. A manual `enabled` patch clears it —
+        // the operator has taken over, so a later proxy re-enable must not
+        // resurrect (or re-kill) this account behind their back.
+        if (has('enabled')) entity.autoDisabledBy = null
         entity.provider = has('provider')
           ? toEnum<Provider>(patch.provider, PROVIDERS, entity.provider)
           : entity.provider
@@ -994,7 +1236,18 @@ export class GraphStore {
           : entity.credentialType
         entity.credentialMask = S('credentialMask', entity.credentialMask)
         entity.region = S('region', entity.region)
-        if (has('proxyId')) entity.proxyId = toNullableStr(patch.proxyId, entity.proxyId)
+        if (has('proxyId')) {
+          const nextProxyId = toNullableStr(patch.proxyId, entity.proxyId)
+          // Unknown proxy ids are ignored (defensive: never store a dangling
+          // reference). Setting it to null while the account sits in a pool is
+          // allowed here but the member is dropped by `syncAccountPoolRefs`
+          // (egress-before-serve) with a warn log.
+          if (nextProxyId !== entity.proxyId && (nextProxyId === null || this.getProxy(nextProxyId))) {
+            entity.proxyId = nextProxyId
+            // A different egress (or none) ends the old cascade's causality.
+            entity.autoDisabledBy = null
+          }
+        }
         entity.reliability = Math.min(1, Math.max(0, N('reliability', entity.reliability)))
         entity.baseLatencyMs = Math.max(1, N('baseLatencyMs', entity.baseLatencyMs))
         entity.models = has('models') ? toStrArray(patch.models, entity.models) : entity.models

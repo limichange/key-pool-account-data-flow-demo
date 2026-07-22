@@ -12,3 +12,5 @@ export const edgeTypes = {
 } as unknown as EdgeTypes
 
 export { FlowEdge }
+export { EdgeChart } from './EdgeChart'
+export type { EdgeChartProps } from './EdgeChart'

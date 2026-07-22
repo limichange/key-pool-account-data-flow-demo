@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, Pause, Play, RotateCcw, SlidersHorizontal, Zap } from 'lucide-react'
-import { formatMs, formatNumber } from '@kpa/shared'
+import {
+  Activity,
+  Check,
+  LayoutGrid,
+  Pause,
+  Play,
+  RotateCcw,
+  SlidersHorizontal,
+  Zap,
+} from 'lucide-react'
+import { formatMs, formatNumber, type GatewayEntity } from '@kpa/shared'
 
-import { Button, IconButton, Sparkline, SliderField, StatusDot, ToggleField } from '@/components'
+import { Button, IconButton, NoticeDialog, SliderField, StatusDot, ToggleField } from '@/components'
 import { useConsole } from '@/lib/store'
 import type { ConnectionState } from '@/lib/store'
 
@@ -18,6 +27,17 @@ const CONNECTION_STATUS = {
   closed: 'offline',
 } as const
 
+/** How long the 自动布局 button shows its 已整理 confirmation. */
+const TIDIED_MS = 1600
+
+const EDITABLE_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT'])
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (EDITABLE_TAGS.has(target.tagName)) return true
+  return target.isContentEditable
+}
+
 interface TopStatProps {
   label: string
   value: string
@@ -29,7 +49,9 @@ function TopStat({ label, value, unit, tone = 'default' }: TopStatProps): JSX.El
   return (
     <div className="kpa-tb-stat" data-tone={tone}>
       <span className="kpa-tb-stat-label">{label}</span>
-      <span className="kpa-tb-stat-value">
+      {/* key= remounts the value when it changes, retriggering the shared
+          tick-flash (feature 13) — presentation only. */}
+      <span className="kpa-tb-stat-value kpa-tick" key={value}>
         {value}
         {unit ? <em className="kpa-tb-stat-unit">{unit}</em> : null}
       </span>
@@ -41,12 +63,16 @@ export function TopBar(): JSX.Element {
   const stats = useConsole((s) => s.stats)
   const config = useConsole((s) => s.config)
   const connection = useConsole((s) => s.connection)
+  const gatewayId = useConsole((s) => (s.state.gateway as GatewayEntity | undefined)?.id ?? null)
   const setSim = useConsole((s) => s.setSim)
   const inject = useConsole((s) => s.inject)
   const reset = useConsole((s) => s.reset)
+  const select = useConsole((s) => s.select)
+  const applyAutoLayout = useConsole((s) => s.applyAutoLayout)
 
   const [tuning, setTuning] = useState(false)
   const [confirmReset, setConfirmReset] = useState(false)
+  const [tidied, setTidied] = useState(false)
   const popoverRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -72,11 +98,14 @@ export function TopBar(): JSX.Element {
     return () => window.clearTimeout(timer)
   }, [confirmReset])
 
-  const okSeries = useMemo(() => stats.timeline.map((p) => p.ok), [stats.timeline])
+  useEffect(() => {
+    if (!tidied) return
+    const timer = window.setTimeout(() => setTidied(false), TIDIED_MS)
+    return () => window.clearTimeout(timer)
+  }, [tidied])
 
   const successRatio = stats.totalRequests > 0 ? (stats.success / stats.totalRequests) * 100 : 100
   const successTone = successRatio >= 99 ? 'ok' : successRatio >= 92 ? 'warn' : 'danger'
-  const tokens = stats.tokensIn + stats.tokensOut
 
   const onToggleRun = useCallback(() => {
     void setSim({ running: !config.running })
@@ -95,9 +124,39 @@ export function TopBar(): JSX.Element {
     void reset()
   }, [confirmReset, reset])
 
+  /** Feature 11: one click (or `A`) computes the tidy layout and persists it in one batch. */
+  const onAutoLayout = useCallback(() => {
+    void applyAutoLayout().then(() => setTidied(true))
+  }, [applyAutoLayout])
+
+  // Keyboard shortcut for auto layout, documented in the button title and 图例.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return
+      if (isTypingTarget(event.target)) return
+      if (event.key === 'a' || event.key === 'A') {
+        event.preventDefault()
+        onAutoLayout()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onAutoLayout])
+
+  const onBrandClick = useCallback(() => {
+    if (gatewayId) select(gatewayId)
+  }, [gatewayId, select])
+
+  const brandTitle = useMemo(
+    () => (gatewayId ? '点击选中网关节点（全局流量入口）' : '网关操作台'),
+    [gatewayId],
+  )
+
   return (
     <header className="kpa-topbar">
-      <div className="kpa-tb-brand">
+      {/* The brand area clicks through to the gateway node — the hero card that
+          carries the full stats readout (timeline, shares, outcomes). */}
+      <button type="button" className="kpa-tb-brand kpa-tb-brand--button" onClick={onBrandClick} title={brandTitle}>
         <span className="kpa-tb-mark" aria-hidden="true">
           <i data-kind="key" />
           <i data-kind="pool" />
@@ -112,18 +171,16 @@ export function TopBar(): JSX.Element {
           <StatusDot status={CONNECTION_STATUS[connection]} size={7} pulse={connection !== 'closed'} />
           {CONNECTION_TEXT[connection]}
         </span>
-      </div>
+      </button>
 
+      {/* Always-visible strip: the compact numbers only. The gateway card owns
+          the richer readout (timeline chart, token throughput, key shares). */}
       <div className="kpa-tb-stats">
         <TopStat label="请求总数" value={formatNumber(stats.totalRequests)} />
         <TopStat label="成功率" value={successRatio.toFixed(1)} unit="%" tone={successTone} />
         <TopStat label="RPS" value={stats.rps.toFixed(1)} />
         <TopStat label="p95 延迟" value={formatMs(stats.p95LatencyMs)} />
         <TopStat label="重试" value={formatNumber(stats.retries)} tone={stats.retries > 0 ? 'warn' : 'default'} />
-        <TopStat label="Token 用量" value={formatNumber(tokens)} />
-        <div className="kpa-tb-spark" title="每秒成功请求数">
-          <Sparkline data={okSeries} width={112} height={22} tone="ok" fill />
-        </div>
       </div>
 
       <div className="kpa-tb-actions">
@@ -138,6 +195,16 @@ export function TopBar(): JSX.Element {
         </Button>
         <Button variant="ghost" size="sm" icon={<Zap size={13} />} onClick={onInject} title="立即注入 5 条请求 (I)">
           注入请求
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon={tidied ? <Check size={13} /> : <LayoutGrid size={13} />}
+          onClick={onAutoLayout}
+          title="一键整理画布布局 (A)"
+          className={tidied ? 'kpa-tb-tidied' : undefined}
+        >
+          {tidied ? '已整理' : '自动布局'}
         </Button>
         <IconButton
           icon={<RotateCcw size={14} />}
@@ -207,6 +274,11 @@ export function TopBar(): JSX.Element {
           ) : null}
         </div>
       </div>
+
+      {/* Feature 10 notices: one modal at a time, fed by the store queue. A
+          portal, so mounting it here (an always-rendered panel) is location
+          independent. */}
+      <NoticeDialog />
     </header>
   )
 }

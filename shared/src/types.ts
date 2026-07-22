@@ -1,13 +1,13 @@
 /**
- * Domain model for the Key -> Pool -> Account -> Proxy gateway console.
+ * Domain model for the Gateway -> Key -> Pool -> Account -> Proxy console.
  *
  * The chain models a typical LLM API gateway:
- *   client --(api key)--> Key --(binding)--> Pool --(routing)--> Account --(egress)--> Proxy --> upstream
+ *   client --> Gateway --(api key)--> Key --(binding)--> Pool --(routing)--> Account --(egress)--> Proxy --> upstream
  */
 
-export type EntityKind = 'key' | 'pool' | 'account' | 'proxy'
+export type EntityKind = 'gateway' | 'key' | 'pool' | 'account' | 'proxy'
 
-export const ENTITY_KINDS: EntityKind[] = ['key', 'pool', 'account', 'proxy']
+export const ENTITY_KINDS: EntityKind[] = ['gateway', 'key', 'pool', 'account', 'proxy']
 
 /** Health / lifecycle state shared by every entity. */
 export type HealthStatus =
@@ -80,6 +80,25 @@ export interface BaseEntity {
   /** Canvas position, persisted server-side so layout survives reloads. */
   position: XY
   metrics: Metrics
+}
+
+/* -------------------------------------------------------------- gateway -- */
+
+/**
+ * The single entry node in front of every key — where ALL client traffic
+ * enters, and the graph read-out of TOTAL traffic. It is a SINGLETON:
+ * exactly one exists (`GraphState.gateway`), it can never be created or
+ * deleted, only PATCHed. The gateway->key edges are system-owned and implicit
+ * (every key hangs off the gateway); they are not user-editable.
+ */
+export interface GatewayEntity extends BaseEntity {
+  kind: 'gateway'
+  /** Public base URL clients call, e.g. https://gw.limi.dev/v1 */
+  endpoint: string
+  /** Global admission control in front of every key. 0 = unlimited (the default). */
+  rateLimit: RateLimit
+  /** Build/version string shown on the card. */
+  version: string
 }
 
 /* ------------------------------------------------------------------ key -- */
@@ -186,6 +205,17 @@ export type Provider = 'anthropic' | 'openai' | 'gemini' | 'bedrock' | 'azure' |
 
 export const PROVIDERS: Provider[] = ['anthropic', 'openai', 'gemini', 'bedrock', 'azure', 'deepseek']
 
+/**
+ * Subscription plan of an upstream account — the thing that determines how
+ * much traffic it can absorb. The plan drives creation DEFAULTS and classification
+ * (see `ACCOUNT_TYPE_PRESETS` in constants.ts); the per-entity
+ * rateLimit/quota stay authoritative for the simulator. It is never a hidden
+ * multiplier.
+ */
+export type AccountType = 'k12' | 'plus' | 'pro' | 'prolite'
+
+export const ACCOUNT_TYPES: AccountType[] = ['k12', 'plus', 'pro', 'prolite']
+
 export type CredentialType = 'api-key' | 'oauth' | 'session'
 
 export interface AccountHealth {
@@ -216,12 +246,26 @@ export interface AccountEntity extends BaseEntity {
    */
   poolId: string | null
   provider: Provider
+  /** Subscription plan; drives defaults and classification, never a hidden multiplier. */
+  accountType: AccountType
   credentialType: CredentialType
   /** Masked credential, e.g. `sk-ant-api03-****9c1d`. */
   credentialMask: string
   region: string
-  /** Egress proxy binding; null means direct connection. */
+  /**
+   * Egress proxy binding. `null` means 未配置代理 — a PARKED account. Egress is
+   * configured BEFORE an account may serve: a proxy-less account can never
+   * join a pool (see `canJoinPool` in utils.ts), so it receives no traffic.
+   */
   proxyId: string | null
+  /**
+   * SERVER-OWNED feature marker: the id of the proxy whose disable cascade
+   * auto-disabled this account, or null. Never client-patchable. Cleared when
+   * the operator toggles the account manually, when the account leaves its
+   * pool, and when it is bound to a different proxy — so re-enabling the proxy
+   * never resurrects an account the operator switched off by hand.
+   */
+  autoDisabledBy: string | null
   rateLimit: RateLimit
   quota: Quota
   health: AccountHealth
@@ -248,10 +292,19 @@ export interface ProxyHealth {
 export interface ProxyEntity extends BaseEntity {
   kind: 'proxy'
   protocol: ProxyProtocol
+  /**
+   * `host`/`port` are the proxy ENDPOINT you dial. They are NOT the egress
+   * address: what the upstream provider sees is `ip` below. Conflating the two
+   * is the bug the `ip` field exists to prevent.
+   */
   host: string
   port: number
   region: string
   countryCode: string
+  /** Egress IP as the upstream sees it — the thing that gets a provider account flagged. */
+  ip: string
+  /** Chinese country/region name matching `countryCode`, e.g. "美国" / "新加坡" / "德国". */
+  country: string
   /** Optional label such as `residential` / `datacenter`. */
   poolType: 'residential' | 'datacenter' | 'mobile'
   maxConcurrency: number
@@ -261,20 +314,24 @@ export interface ProxyEntity extends BaseEntity {
   baseLatencyMs: number
 }
 
-export type Entity = KeyEntity | PoolEntity | AccountEntity | ProxyEntity
+export type Entity = GatewayEntity | KeyEntity | PoolEntity | AccountEntity | ProxyEntity
 
 /** Narrow an entity by kind. */
-export type EntityOf<K extends EntityKind> = K extends 'key'
-  ? KeyEntity
-  : K extends 'pool'
-    ? PoolEntity
-    : K extends 'account'
-      ? AccountEntity
-      : ProxyEntity
+export type EntityOf<K extends EntityKind> = K extends 'gateway'
+  ? GatewayEntity
+  : K extends 'key'
+    ? KeyEntity
+    : K extends 'pool'
+      ? PoolEntity
+      : K extends 'account'
+        ? AccountEntity
+        : ProxyEntity
 
 /* ---------------------------------------------------------------- graph -- */
 
 export interface GraphState {
+  /** SINGLETON entry node in front of every key. Not creatable, not deletable. */
+  gateway: GatewayEntity
   keys: KeyEntity[]
   pools: PoolEntity[]
   accounts: AccountEntity[]
@@ -282,10 +339,39 @@ export interface GraphState {
   updatedAt: number
 }
 
+/* --------------------------------------------------------- edge metrics -- */
+
+/**
+ * Rolling traffic counters kept per RELATION of the graph, keyed by the same
+ * `edgeId(sourceId, targetId)` the React Flow edge uses. The server derives
+ * the full edge list from the graph itself (gateway->key, key.bindings,
+ * pool.members, pool.failoverPoolId, account.proxyId), so a relation with no
+ * traffic yet still reports zeroes and dies the moment the relation does.
+ */
+export interface EdgeMetrics {
+  /** edgeId(sourceId, targetId) - the same id the React Flow edge uses. */
+  id: string
+  sourceId: string
+  targetId: string
+  sourceKind: EntityKind
+  requests: number
+  success: number
+  failed: number
+  /** Rolling requests-per-minute estimate over the last 60s. */
+  rpm: number
+  tokens: number
+  avgLatencyMs: number
+  lastAt: number | null
+  /** Newest-last request counts, one bucket per simulated second. Length EDGE_HISTORY_SIZE. */
+  history: number[]
+}
+
 /* -------------------------------------------------------------- tracing -- */
 
 export type RequestOutcome =
   | 'success'
+  | 'gateway-disabled'
+  | 'gateway-rate-limited'
   | 'key-disabled'
   | 'key-rate-limited'
   | 'key-quota-exceeded'
@@ -299,6 +385,8 @@ export type RequestOutcome =
   | 'timeout'
 
 export const FAILURE_OUTCOMES: RequestOutcome[] = [
+  'gateway-disabled',
+  'gateway-rate-limited',
   'key-disabled',
   'key-rate-limited',
   'key-quota-exceeded',

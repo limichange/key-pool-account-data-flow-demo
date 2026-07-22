@@ -1,9 +1,9 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { Handle, Position, useStore } from '@xyflow/react'
 import clsx from 'clsx'
 import { COMPACT_ZOOM, LAYOUT, type Entity, type EntityKind } from '@kpa/shared'
 
-import { StatusDot } from '@/components'
+import { InlineName, StatusDot, Switch } from '@/components'
 import { statusLabel } from '@/lib/format'
 import { useConsole, useNodePulse } from '@/lib/store'
 
@@ -11,10 +11,10 @@ import { useConsole, useNodePulse } from '@/lib/store'
 export type NodeHandles = 'out' | 'in-out' | 'in'
 
 /**
- * One fixed template shared by all four kinds so the eye can learn a single
- * card and reuse it across the chain:
+ * One fixed template shared by all four chain kinds so the eye can learn a
+ * single card and reuse it across the chain:
  *
- *   1. identity row   icon · name · id · status
+ *   1. identity row   icon · name (inline-renamable) · enable switch · status
  *   2. badge row      kind-specific chips
  *   3. detail line    secret | strategy | credential | host   +   one aside
  *   4. body           the kind-specific block (bars, members, gauge, …)
@@ -41,6 +41,18 @@ export interface NodeShellProps {
   handles: NodeHandles
   dimmed?: boolean
   traced?: boolean
+  /**
+   * Feature 5: the node currently has no upstream relation at all (a pool with
+   * no keys, an account with no pool, a proxy with no accounts). Legal and
+   * temporary — dashed border plus a 未接入 pill, never hidden.
+   */
+  detached?: boolean
+  /**
+   * Overrides what the header enable switch does. The default writes
+   * `{ enabled }` straight to the server; ProxyNode overrides it to run the
+   * feature-10 confirm flow before cascading onto its in-pool accounts.
+   */
+  onToggleEnabled?: (next: boolean) => void
   className?: string
 }
 
@@ -67,10 +79,13 @@ export function NodeShell({
   handles,
   dimmed = false,
   traced = false,
+  detached = false,
+  onToggleEnabled,
   className,
 }: NodeShellProps): JSX.Element {
   const pulseAt = useNodePulse(entity.id)
   const lastOk = useConsole((s) => s.nodeActivity[entity.id]?.lastOk ?? true)
+  const updateEntity = useConsole((s) => s.updateEntity)
   const [pulse, setPulse] = useState<PulseTone | null>(null)
   // Level of detail: below this zoom the dense body is unreadable texture, so
   // the card degrades to a legible topology tile instead of grey mush.
@@ -83,6 +98,21 @@ export function NodeShell({
     return () => window.clearTimeout(timer)
   }, [pulseAt, lastOk])
 
+  const commitName = useCallback(
+    (name: string) => {
+      void updateEntity(entity.kind, entity.id, { name })
+    },
+    [updateEntity, entity.kind, entity.id],
+  )
+
+  const toggleEnabled = useCallback(
+    (next: boolean) => {
+      if (onToggleEnabled) onToggleEnabled(next)
+      else void updateEntity(entity.kind, entity.id, { enabled: next })
+    },
+    [onToggleEnabled, updateEntity, entity.kind, entity.id],
+  )
+
   const showIn = handles === 'in' || handles === 'in-out'
   const showOut = handles === 'out' || handles === 'in-out'
 
@@ -94,6 +124,8 @@ export function NodeShell({
       data-selected={selected || undefined}
       data-dimmed={dimmed || undefined}
       data-traced={traced || undefined}
+      data-detached={detached || undefined}
+      data-enabled={entity.enabled ? undefined : 'false'}
       data-pulse={pulse ?? undefined}
       style={{ width: LAYOUT.nodeWidth[entity.kind] }}
     >
@@ -109,11 +141,20 @@ export function NodeShell({
       <header className="kpa-node__header">
         <span className="kpa-node__icon">{icon}</span>
         <span className="kpa-node__ident">
-          <span className="kpa-node__name" title={entity.name}>
-            {entity.name}
-          </span>
+          <InlineName value={entity.name} onCommit={commitName} className="kpa-node__name" />
           {compact ? null : <span className="kpa-node__subtitle">{subtitle}</span>}
         </span>
+        {detached ? (
+          <span className="kpa-node__detached" title="未接入任何上游，不会收到流量">
+            未接入
+          </span>
+        ) : null}
+        <Switch
+          checked={entity.enabled}
+          onChange={toggleEnabled}
+          label={entity.enabled ? '停用该节点' : '启用该节点'}
+          className="kpa-node__switch"
+        />
         <span className="kpa-node__status" title={statusLabel(entity.status)}>
           <StatusDot status={entity.status} pulse={entity.status !== 'disabled'} />
           <span className="kpa-node__status-text">{statusLabel(entity.status)}</span>

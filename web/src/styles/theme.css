@@ -94,6 +94,27 @@
   --ring: 0 0 0 1px var(--border-strong);
 
   --transition: 160ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* HUD finish (feature 13) — every surface reads THESE, so the whole console
+     shares one corner detail, one top-edge light, one glow radius and one
+     tick-flash timing. Purely decorative; contrast never depends on them. */
+  --hud-tick: 8px; /* corner-tick arm length */
+  --hud-tick-color: color-mix(in srgb, var(--text-dim) 75%, transparent);
+  --edge-light: inset 0 1px 0 rgba(255, 255, 255, 0.04); /* panel top-edge highlight */
+  --glow-soft: 0 0 18px; /* hover glow radius (node cards) */
+  --glow-ring: 0 0 26px; /* selected glow radius (node cards) */
+  --tick-flash-ms: 150ms; /* live-number change flash */
+  --sweep-period: 22s; /* canvas scan-sweep interval */
+  --track-num: 0.02em; /* tracking for live mono numbers */
+  /* The four-hue chain in reading order — TopBar accent line, gateway chrome. */
+  --chain-gradient: linear-gradient(
+    90deg,
+    var(--key),
+    var(--pool),
+    var(--account),
+    var(--proxy),
+    var(--key)
+  );
 }
 
 /* Per-kind accent helper: put `data-kind="key|pool|account|proxy"` on a wrapper

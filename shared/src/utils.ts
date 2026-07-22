@@ -1,5 +1,6 @@
 import type {
   AccountEntity,
+  EdgeMetrics,
   Entity,
   EntityKind,
   GraphState,
@@ -8,7 +9,7 @@ import type {
   PoolEntity,
   XY,
 } from './types.js'
-import { KIND_ORDER, LAYOUT, METRICS_HISTORY_SIZE } from './constants.js'
+import { EDGE_HISTORY_SIZE, KIND_ORDER, LAYOUT, METRICS_HISTORY_SIZE } from './constants.js'
 
 /** Canonical edge id, shared by the simulator traces and the React Flow graph. */
 export function edgeId(sourceId: string, targetId: string): string {
@@ -46,6 +47,29 @@ export function createMetrics(): Metrics {
   }
 }
 
+/** Zeroed per-edge counters for a relation that just appeared in the graph. */
+export function createEdgeMetrics(
+  id: string,
+  sourceId: string,
+  targetId: string,
+  sourceKind: EntityKind,
+): EdgeMetrics {
+  return {
+    id,
+    sourceId,
+    targetId,
+    sourceKind,
+    requests: 0,
+    success: 0,
+    failed: 0,
+    rpm: 0,
+    tokens: 0,
+    avgLatencyMs: 0,
+    lastAt: null,
+    history: new Array<number>(EDGE_HISTORY_SIZE).fill(0),
+  }
+}
+
 /** True when the entity can currently serve traffic. */
 export function isServing(status: HealthStatus): boolean {
   return status === 'healthy' || status === 'degraded'
@@ -57,7 +81,7 @@ export function successRate(metrics: Metrics): number {
 }
 
 export function allEntities(state: GraphState): Entity[] {
-  return [...state.keys, ...state.pools, ...state.accounts, ...state.proxies]
+  return [state.gateway, ...state.keys, ...state.pools, ...state.accounts, ...state.proxies]
 }
 
 /* --------------------------------------------------------- pool ownership -- */
@@ -97,6 +121,50 @@ export function unassignedAccounts(state: GraphState): AccountEntity[] {
     for (const member of pool.members) owned.add(member.accountId)
   }
   return state.accounts.filter((account) => !owned.has(account.id))
+}
+
+/* ------------------------------------------------------------- detachment -- */
+
+/*
+ * Detachment (游离 / 未接入) is a temporary, LEGAL state a pool, account or
+ * proxy can be parked in while rewiring: it simply has no upstream relation
+ * and therefore receives no traffic. It is ORTHOGONAL to HealthStatus — a
+ * detached-but-healthy pool is still "healthy" — so these helpers are the only
+ * vocabulary for it; no status value exists for it on purpose.
+ */
+
+/**
+ * True when the entity has no upstream relation at all: a pool no key binds, an
+ * account owned by no pool, a proxy no account references. The gateway is
+ * always the root and every key implicitly hangs off the gateway, so those two
+ * kinds are never detached.
+ */
+export function isDetached(state: GraphState, entity: Entity): boolean {
+  switch (entity.kind) {
+    case 'gateway':
+    case 'key':
+      return false
+    case 'pool':
+      return !state.keys.some((key) => key.bindings.some((b) => b.poolId === entity.id))
+    case 'account':
+      return !state.pools.some((pool) => pool.members.some((m) => m.accountId === entity.id))
+    case 'proxy':
+      return !state.accounts.some((account) => account.proxyId === entity.id)
+  }
+}
+
+/** Every detached entity of the graph, in `allEntities` order. */
+export function detachedEntities(state: GraphState): Entity[] {
+  return allEntities(state).filter((entity) => isDetached(state, entity))
+}
+
+/**
+ * Egress-before-serve rule: an account may only join a pool once it has an
+ * egress proxy bound. Enforced on every server path that can add a member
+ * (bind, pool `members` patch, seed, reset).
+ */
+export function canJoinPool(account: AccountEntity): boolean {
+  return account.proxyId !== null
 }
 
 /* ------------------------------------------------------------------ layout -- */
@@ -162,6 +230,7 @@ export function layoutSlotFor(counts: KindCounts, kind: EntityKind, index: numbe
 /** Number of entities of every kind currently in the graph. */
 export function kindCounts(state: GraphState): Record<EntityKind, number> {
   return {
+    gateway: 1,
     key: state.keys.length,
     pool: state.pools.length,
     account: state.accounts.length,

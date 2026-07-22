@@ -48,9 +48,34 @@
   padding: 0 var(--space-3);
   background: linear-gradient(180deg, var(--bg-panel-2), var(--bg-panel));
   border-bottom: 1px solid var(--border);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--edge-light), var(--shadow-sm);
   position: relative;
   z-index: 20;
+}
+
+/* Feature 13: a thin chain-hued accent line under the bar, shimmering very
+   slowly. Absolute, so the 48px header row never moves. */
+.kpa-topbar::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--chain-gradient);
+  background-size: 200% 100%;
+  opacity: 0.55;
+  pointer-events: none;
+  animation: kpa-chain-shimmer 28s linear infinite;
+}
+
+@keyframes kpa-chain-shimmer {
+  from {
+    background-position: 0% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
 }
 
 .kpa-tb-brand {
@@ -141,6 +166,7 @@
   font-family: var(--font-mono);
   font-size: var(--fs-md);
   font-variant-numeric: tabular-nums;
+  letter-spacing: var(--track-num);
   color: var(--tone-color);
   white-space: nowrap;
 }
@@ -183,7 +209,7 @@
   background: var(--bg-panel-2);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--edge-light), var(--shadow-lg);
   z-index: 60;
   animation: kpa-pop-in var(--transition);
 }
@@ -547,6 +573,13 @@
   background:
     linear-gradient(180deg, var(--accent-soft), transparent 60%),
     var(--bg-panel-2);
+  box-shadow: var(--edge-light);
+}
+
+/* The identity card's corner ticks take the entity accent. */
+.kpa-insp-head::before,
+.kpa-insp-head::after {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .kpa-insp-head-top {
@@ -1360,4 +1393,199 @@
   min-width: 0;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+/* ===================================================== additions: v2 ===== */
+
+/* Brand area doubles as a button that selects the gateway node. */
+button.kpa-tb-brand--button {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.kpa-tb-brand--button:hover .kpa-tb-title {
+  color: var(--text);
+  text-shadow: 0 0 12px rgba(205, 215, 232, 0.35);
+}
+
+/* 自动布局 button flashes its 已整理 confirmation. */
+.kpa-tb-tidied {
+  color: var(--ok);
+}
+
+/* ------------------------------------------- inspector: per-edge metrics --
+   One aligned row per relation: micro bars · requests · success rate · share.
+   Fixed cell widths so a stack of rows compares at a glance. */
+
+.kpa-insp-edge {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  font-size: var(--fs-xs);
+}
+
+.kpa-insp-edge[data-idle] {
+  color: var(--text-faint);
+}
+
+.kpa-insp-edge-bars {
+  flex: none;
+}
+
+.kpa-insp-edge-req {
+  flex: 1 1 auto;
+  min-width: 52px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.kpa-insp-edge[data-idle] .kpa-insp-edge-req {
+  color: var(--text-faint);
+}
+
+.kpa-insp-edge-rate {
+  flex: none;
+  width: 36px;
+  text-align: right;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.kpa-insp-edge-rate[data-tone='ok'] {
+  color: var(--ok);
+}
+.kpa-insp-edge-rate[data-tone='warn'] {
+  color: var(--warn);
+}
+.kpa-insp-edge-rate[data-tone='danger'] {
+  color: var(--danger);
+}
+
+.kpa-insp-edge-share {
+  flex: none;
+  width: 38px;
+  padding-left: var(--space-1);
+  border-left: 1px solid var(--border-subtle);
+  text-align: right;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------ inspector: detachment -- */
+
+.kpa-insp-detach {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.kpa-insp-detach .kpa-insp-hint {
+  margin: 0;
+}
+
+/* Loose-validation tint: the field looks wrong but saving is never blocked. */
+.kpa-field--warn .kpa-input {
+  border-color: color-mix(in srgb, var(--warn) 60%, var(--border));
+}
+
+.kpa-field--warn .kpa-field__hint {
+  color: var(--warn);
+}
+
+/* Stacked user rows (proxy inspector): identity line + edge metrics line. */
+.kpa-insp-user--stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1);
+}
+
+.kpa-insp-user-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.kpa-insp-user-row .kpa-insp-user-meta {
+  margin-left: auto;
+}
+
+/* -------------------------------------------- palette: type breakdown ---- */
+
+.kpa-pal-types {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.kpa-pal-type-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+}
+
+.kpa-pal-type-count {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.kpa-pal-type-bad {
+  flex: none;
+  min-width: 44px;
+  text-align: right;
+  color: var(--text-faint);
+}
+
+.kpa-pal-type-row[data-warn='true'] .kpa-pal-type-bad {
+  color: var(--warn);
+}
+
+/* --------------------------------------------- trace log: hop geo chip --- */
+
+.kpa-tl-hop-geo {
+  margin-left: var(--space-1);
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+/* ================================================ feature 13: HUD finish == */
+
+/* Every live number in the panels shares the same tracking as `.kpa-mono`,
+   so the read-outs form one typographic voice across the console. */
+.kpa-tl-time,
+.kpa-tl-tokens,
+.kpa-tl-latency,
+.kpa-tl-count,
+.kpa-tl-attempt-idx,
+.kpa-tl-attempt-latency,
+.kpa-tl-hop-latency,
+.kpa-events__time,
+.kpa-events__count,
+.kpa-pal-matchcount,
+.kpa-pal-chip-count,
+.kpa-insp-edge-req {
+  letter-spacing: var(--track-num);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kpa-topbar::after {
+    animation: none;
+  }
 }

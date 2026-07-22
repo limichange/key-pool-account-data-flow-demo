@@ -41,3 +41,26 @@ export type { EmptyProps } from './Empty'
 
 export { Gauge } from './Gauge'
 export type { GaugeProps, GaugeTone } from './Gauge'
+
+export { MiniBars } from './MiniBars'
+export type { MiniBarsProps, MiniBarsTone } from './MiniBars'
+
+export { InlineName } from './InlineName'
+export type { InlineNameProps } from './InlineName'
+
+export { Switch } from './Switch'
+export type { SwitchProps } from './Switch'
+
+export { ConfirmDialog } from './ConfirmDialog'
+export type { ConfirmDialogProps } from './ConfirmDialog'
+
+export { NoticeDialog } from './NoticeDialog'
+
+export {
+  DELETE_IRREVERSIBLE_NOTE,
+  deleteConsequences,
+  proxyDisableCasualties,
+  proxyDisableMessage,
+  proxyEnableMessage,
+  proxyEnableRevivals,
+} from './consequences'

@@ -1,21 +1,23 @@
 import { useCallback, useMemo } from 'react'
-import { AlertTriangle, Plus, Search } from 'lucide-react'
+import { AlertTriangle, Plus, Search, Unplug } from 'lucide-react'
 import {
-  ENTITY_KINDS,
+  ACCOUNT_TYPES,
+  ACCOUNT_TYPE_LABEL_CN,
   HEALTH_STATUSES,
   KIND_LABEL_CN,
+  KIND_ORDER,
   STATUS_LABEL_CN,
-  allEntities,
+  detachedEntities,
   isServing,
-  unassignedAccounts,
 } from '@kpa/shared'
-import type { EntityKind } from '@kpa/shared'
+import type { Entity, EntityKind, GatewayEntity } from '@kpa/shared'
 
 import { IconButton, MetricBar, Section, StatusDot, TextField, ToggleField } from '@/components'
 import { kindIcon } from '@/lib/format'
 import { useConsole } from '@/lib/store'
 
 const CHAIN_HINT: Record<EntityKind, string> = {
+  gateway: '统一入口：所有客户端请求先经过网关，网关到密钥的边即每个密钥的流量份额',
   key: '客户端凭证：携带配额与限流，绑定到一个或多个池',
   pool: '路由池：按策略在成员账号之间分发请求',
   account: '上游账号：真正持有供应商凭证并发起调用',
@@ -23,29 +25,37 @@ const CHAIN_HINT: Record<EntityKind, string> = {
 }
 
 const CREATE_LABEL: Record<EntityKind, string> = {
+  gateway: '', // singleton — never creatable
   key: '新建密钥',
   pool: '新建池',
   account: '新建账号',
   proxy: '新建代理',
 }
 
+/** Kinds the operator can create: the gateway is a singleton, never creatable. */
+const CREATABLE_KINDS = KIND_ORDER.filter((kind) => kind !== 'gateway')
+
 /**
- * The four relations and their exact cardinality. This is the clearest place in
- * the console to teach the model, so it is spelled out rather than implied.
+ * The relations and their exact cardinality, plus the edge colour rule. This
+ * is the clearest place in the console to teach the model, so it is spelled
+ * out rather than implied.
  */
 const CARDINALITY_RULES: [string, string][] = [
+  ['网关 → 密钥', '单一入口：所有请求先经网关再分流到密钥；该边隐式存在，不可编辑'],
   ['密钥 ⇄ 池', '多对多：一个密钥可绑定多个池，一个池也能被多个密钥绑定'],
   ['池 → 账号', '一对多：一个池持有多个账号，但一个账号只能属于一个池'],
   ['账号 → 代理', '多对一：一个账号最多一个代理，一个代理可服务多个账号'],
-  ['未分配账号', '合法状态：不属于任何池，在加入池之前不会收到任何流量'],
+  ['游离节点', '合法状态：池 / 账号 / 代理可以暂时没有任何上游，接入之前不收流量'],
+  ['连线颜色', '两端节点都启用 = 绿色（链路存活）；任一端停用 = 灰色虚线（链路断开）'],
 ]
 
 const SHORTCUTS: [string, string][] = [
   ['Space', '暂停 / 继续模拟器'],
   ['I', '注入 5 条请求'],
+  ['A', '自动布局：一键整理画布'],
   ['L', '收起 / 展开请求流'],
   ['M', '显示 / 隐藏小地图'],
-  ['Del', '删除选中的节点或连线'],
+  ['Del', '删除选中的节点或连线（弹出确认）'],
   ['Esc', '取消选中与链路高亮'],
 ]
 
@@ -59,41 +69,67 @@ export function Palette(): JSX.Element {
   const setOnlyProblems = useConsole((s) => s.setOnlyProblems)
   const createEntity = useConsole((s) => s.createEntity)
 
+  /** Every entity including the gateway singleton (it is not in a list). */
+  const everything = useMemo<Entity[]>(() => {
+    const gateway = state.gateway as GatewayEntity | undefined
+    return [
+      ...(gateway ? [gateway as Entity] : []),
+      ...state.keys,
+      ...state.pools,
+      ...state.accounts,
+      ...state.proxies,
+    ]
+  }, [state])
+
   const rollup = useMemo(() => {
-    const list = allEntities(state)
-    const empty = { total: 0, healthy: 0 }
-    const acc: Record<EntityKind, { total: number; healthy: number }> = {
-      key: { ...empty },
-      pool: { ...empty },
-      account: { ...empty },
-      proxy: { ...empty },
-    }
-    for (const entity of list) {
+    const acc = {} as Record<EntityKind, { total: number; healthy: number }>
+    for (const kind of KIND_ORDER) acc[kind] = { total: 0, healthy: 0 }
+    for (const entity of everything) {
       const bucket = acc[entity.kind]
       bucket.total += 1
       if (entity.enabled && isServing(entity.status)) bucket.healthy += 1
     }
     return acc
-  }, [state])
+  }, [everything])
 
   /**
-   * Accounts owned by no pool. Zero is legal, but such an account is a dead
-   * end — it receives no traffic — so it must never be invisible.
+   * Feature 5: pools / accounts / proxies with no upstream relation at all.
+   * A detached node is legal but a dead end — it must never be invisible.
    */
-  const orphans = useMemo(() => unassignedAccounts(state).length, [state])
+  const detached = useMemo(() => detachedEntities(state), [state])
+  const detachedTitle = useMemo(() => {
+    if (detached.length === 0) return '每个池 / 账号 / 代理都已接入上游'
+    const byKind = new Map<EntityKind, number>()
+    for (const item of detached) byKind.set(item.kind, (byKind.get(item.kind) ?? 0) + 1)
+    const parts = Array.from(byKind.entries()).map(
+      ([kind, count]) => `${KIND_LABEL_CN[kind]} ${count}`,
+    )
+    return `这些节点没有任何上游关联，不会收到流量：${parts.join('，')}`
+  }, [detached])
+
+  /** Feature 7: plan-type mix across the account fleet, with unhealthy counts. */
+  const typeBreakdown = useMemo(
+    () =>
+      ACCOUNT_TYPES.map((type) => {
+        const of = state.accounts.filter((a) => a.accountType === type)
+        const bad = of.filter((a) => !a.enabled || !isServing(a.status)).length
+        return { type, total: of.length, bad }
+      }),
+    [state.accounts],
+  )
 
   /** How many entities the current free-text search actually matches. */
   const matchCount = useMemo(() => {
     const needle = search.trim().toLowerCase()
     if (needle.length === 0) return -1
-    return allEntities(state).filter((entity) => {
+    return everything.filter((entity) => {
       if (!kindFilter[entity.kind]) return false
       if (onlyProblems && entity.status === 'healthy') return false
       return `${entity.id} ${entity.name} ${entity.note} ${entity.tags.join(' ')}`
         .toLowerCase()
         .includes(needle)
     }).length
-  }, [state, search, kindFilter, onlyProblems])
+  }, [everything, search, kindFilter, onlyProblems])
 
   const onCreate = useCallback(
     (kind: EntityKind) => {
@@ -110,7 +146,7 @@ export function Palette(): JSX.Element {
           urgent action in a read-only demo (creating entities) comes last. */}
       <Section title="概览" dense rail="hide">
         <div className="kpa-pal-rollup">
-          {ENTITY_KINDS.map((kind) => {
+          {KIND_ORDER.map((kind) => {
             const { total, healthy } = rollup[kind]
             const bad = total - healthy
             const tone = bad === 0 ? 'ok' : bad * 2 > total ? 'danger' : 'warn'
@@ -134,18 +170,26 @@ export function Palette(): JSX.Element {
           })}
           <div
             className="kpa-pal-orphans"
-            data-warn={orphans > 0 ? 'true' : undefined}
-            title={
-              orphans > 0
-                ? '这些账号不属于任何池，不会收到任何流量'
-                : '每个账号都已归属到某个池'
-            }
+            data-warn={detached.length > 0 ? 'true' : undefined}
+            title={detachedTitle}
           >
             <span className="kpa-pal-orphans-label">
-              {orphans > 0 ? <AlertTriangle size={11} /> : null}
-              未分配账号
+              {detached.length > 0 ? <Unplug size={11} /> : null}
+              游离节点
             </span>
-            <span className="kpa-pal-orphans-count">{orphans}</span>
+            <span className="kpa-pal-orphans-count">{detached.length}</span>
+          </div>
+          <div className="kpa-pal-types">
+            <div className="kpa-pal-caption">账号类型</div>
+            {typeBreakdown.map(({ type, total, bad }) => (
+              <div className="kpa-pal-type-row" key={type} data-warn={bad > 0 ? 'true' : undefined}>
+                <span className="kpa-type-badge" data-type={type}>
+                  {ACCOUNT_TYPE_LABEL_CN[type]}
+                </span>
+                <span className="kpa-pal-type-count kpa-mono">{total}</span>
+                <span className="kpa-pal-type-bad">{bad > 0 ? `${bad} 异常` : ''}</span>
+              </div>
+            ))}
           </div>
         </div>
       </Section>
@@ -159,7 +203,7 @@ export function Palette(): JSX.Element {
           hint="匹配的节点高亮，其余淡出"
         />
         <div className="kpa-pal-chips" role="group" aria-label="按类型筛选（隐藏后节点会移出画布）">
-          {ENTITY_KINDS.map((kind) => {
+          {KIND_ORDER.map((kind) => {
             const Icon = kindIcon(kind)
             const active = kindFilter[kind]
             return (
@@ -222,7 +266,7 @@ export function Palette(): JSX.Element {
 
       <Section title="图例" dense collapsible defaultOpen={false} rail="hide">
         <ol className="kpa-pal-chain">
-          {ENTITY_KINDS.map((kind, i) => (
+          {KIND_ORDER.map((kind, i) => (
             <li className="kpa-pal-chain-row" data-kind={kind} key={kind}>
               <span className="kpa-pal-swatch" />
               <span className="kpa-pal-chain-text">
@@ -234,7 +278,7 @@ export function Palette(): JSX.Element {
             </li>
           ))}
         </ol>
-        <div className="kpa-pal-caption">关系基数</div>
+        <div className="kpa-pal-caption">关系与规则</div>
         <dl className="kpa-pal-rules">
           {CARDINALITY_RULES.map(([relation, rule]) => (
             <div className="kpa-pal-rule-row" key={relation}>
@@ -258,7 +302,7 @@ export function Palette(): JSX.Element {
 
       <Section title="新建" dense>
         <div className="kpa-pal-create">
-          {ENTITY_KINDS.map((kind) => {
+          {CREATABLE_KINDS.map((kind) => {
             const Icon = kindIcon(kind)
             return (
               <div className="kpa-pal-create-row" data-kind={kind} key={kind}>
