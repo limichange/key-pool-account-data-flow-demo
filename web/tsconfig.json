@@ -7,6 +7,7 @@
     "baseUrl": ".",
     "paths": {
       "@kpa/shared": ["../shared/src/index.ts"],
+      "@kpa/sim/*": ["../server/src/*"],
       "@/*": ["./src/*"]
     }
   },

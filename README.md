@@ -25,25 +25,26 @@
 
 ## 快速开始
 
+**纯前端应用，没有后端进程**——模拟引擎直接在浏览器里运行。
+
 ```bash
 pnpm install          # 安装 workspace 依赖
-pnpm dev              # 同时启动模拟器 (127.0.0.1:8787) 和前端 (127.0.0.1:5173)
+pnpm dev              # 启动 Vite (127.0.0.1:5173)
 ```
 
 打开 <http://127.0.0.1:5173> 即可。模拟器默认就是**运行中**的（`rps=7, chaos=0.02`），
 所以页面一加载就有流量在跑。
 
-单独启动：
-
 ```bash
-pnpm dev:server       # 只跑 Node 模拟器（tsx watch）
-pnpm dev:web          # 只跑 Vite 前端（/api 与 /ws 会代理到 8787）
 pnpm typecheck        # shared + server + web 三个包的 tsc --noEmit
-pnpm build            # 构建前端产物
+pnpm build            # 产出 web/dist —— 纯静态文件
+pnpm preview          # 本地预览构建产物
 ```
 
-模拟器端口可用环境变量覆盖：`PORT=9000 HOST=0.0.0.0 pnpm dev:server`
-（改端口后记得同步 `web/vite.config.ts` 里的 `SERVER_ORIGIN`）。
+**部署演示**：`pnpm build` 之后把 `web/dist/` 扔到任何静态托管
+（GitHub Pages / Vercel / Netlify / `python -m http.server`）就能用，
+不需要任何服务器。状态（拓扑、改名、暂停等）通过 localStorage 在刷新之间保持，
+点顶栏「重置」恢复初始种子拓扑。多个标签页各跑各的模拟器，互不同步。
 
 ---
 
@@ -58,10 +59,10 @@ pnpm build            # 构建前端产物
 │   ├── constants.ts            #   中英文标签、模型列表、画布几何、TICK_MS、缓冲区大小
 │   └── utils.ts                #   edgeId() / createMetrics() / formatMs() / clamp() …
 │
-├── server/src/                 # Node 模拟器（express 4 + ws）
-│   ├── index.ts                #   HTTP 路由 + WebSocket 广播 + 生命周期
+├── server/src/                 # 模拟引擎（纯 TS，被 web 打包进浏览器运行，无服务器）
 │   ├── simulator.ts            #   核心：按 tick 生成流量、routeRequest 全链路、重试/熔断/指标
 │   ├── store.ts                #   GraphStore：增删改查、绑定校验、状态重算
+│   ├── edges.ts                #   EdgeMetricsStore：逐边指标归因与生命周期
 │   ├── seed.ts                 #   种子拓扑：7 密钥 / 6 池 / 16 账号 / 7 代理
 │   └── rng.ts                  #   可复现的 mulberry32 随机数
 │
@@ -69,8 +70,9 @@ pnpm build            # 构建前端产物
     ├── App.tsx                 #   应用外壳：栅格布局、WebSocket 生命周期、全局快捷键、错误边界
     ├── lib/                    #   数据层
     │   ├── store.ts            #     zustand store（唯一状态源）+ trace 批处理
-    │   ├── api.ts              #     REST 封装
-    │   ├── socket.ts           #     自动重连 WebSocket（500ms → 5s 退避）
+    │   ├── local.ts            #     浏览器内引擎单例 + localStorage 持久化
+    │   ├── api.ts              #     命令面（委托给 local.ts，签名保持 Promise）
+    │   ├── socket.ts           #     事件订阅（对接 local.ts 的事件流）
     │   ├── graph.ts            #     GraphState → React Flow 节点/边 + dagre 自动布局
     │   └── format.ts           #     状态/结果/供应商的中文标签与图标
     ├── components/             #   UI 原子组件（StatusDot / Sparkline / MetricBar / Gauge / 表单…）
@@ -249,49 +251,27 @@ pnpm build            # 构建前端产物
 
 ---
 
-## API
+## 内部接口（浏览器内引擎）
 
-REST 前缀 `/api`，WebSocket 路径 `/ws`，服务监听 `127.0.0.1:8787`。
-Vite dev server 会把这两个路径代理过去，所以前端始终用同源相对路径请求。
+没有 HTTP 服务：`server/src` 里的模拟引擎被打包进页面，
+`web/src/lib/local.ts` 持有引擎单例并暴露与旧 REST 一一对应的方法
+（`getState / createEntity / updateEntity / deleteEntity / move / moveBatch /
+bind / unbind / setSim / inject / reset / getTraces`），
+`web/src/lib/api.ts` 保持 Promise 签名原样委托过去——所以上层 store 完全不感知这次替换，
+以后想换回远程后端也只需要改这两个文件。
 
-### REST
+命令面的语义与旧 REST 相同：`:kind` 用单数（`gateway` / `key` / `pool` / `account` / `proxy`），
+`gateway` 为单例（不可创建/删除），PATCH 字段白名单过滤、`rateLimit` / `quota` / `health` 深合并，
+非法操作抛出中文 `Error`，由 store 转成操作日志而不是崩掉页面。
 
-| 方法 | 路径 | 请求体 | 响应 |
-| --- | --- | --- | --- |
-| `GET` | `/api/state` | — | `{ state, config, stats, edges }`（`edges` 为全量逐边指标，零流量的边也在） |
-| `POST` | `/api/entities/:kind` | `Partial<Entity>` | `201` + 新建的 `Entity`（`gateway` 为单例，返回 400） |
-| `PATCH` | `/api/entities/:kind/:id` | `Partial<Entity>` | 更新后的 `Entity` |
-| `DELETE` | `/api/entities/:kind/:id` | — | `{ ok: true }`，同时解除全部关联（`gateway` 不可删除，返回 400；删代理会级联把账号移出池） |
-| `POST` | `/api/entities/:id/move` | `{ position: { x, y } }` | `Entity` |
-| `POST` | `/api/entities/move-batch` | `{ moves: [{ id, position }] }` | `{ ok: true }`（自动布局一次性保存全图用） |
-| `POST` | `/api/bind` | `{ source: { kind, id }, target: { kind, id } }` | `{ ok: true }` |
-| `POST` | `/api/unbind` | 同上 | `{ ok: true }` |
-| `POST` | `/api/sim` | `Partial<SimConfig>` | 完整的 `SimConfig` |
-| `POST` | `/api/inject` | `{ keyId?, count?, model? }` | `{ traces: RequestTrace[] }` |
-| `POST` | `/api/reset` | — | `{ state, config, stats }` |
-| `GET` | `/api/traces?limit=n` | — | `{ traces: RequestTrace[] }` |
+**持久化**：引擎每 1.5s（节流）把 `{ state, config }` 写入
+`localStorage["kpa:standalone:v1"]`，页面隐藏/关闭时立即落盘；启动时若存在且校验通过则恢复，
+否则用种子拓扑。「重置」清空存储并重新播种。trace 流与全局统计不持久化（刷新后从零累计）。
 
-`:kind` 用单数：`gateway` / `key` / `pool` / `account` / `proxy`。PATCH 的字段是白名单过滤的，
-未知字段静默忽略，`rateLimit` / `quota` / `health` 走深合并，`failoverPoolId` 不允许指向自己。
-非法请求返回 `{ error: "中文说明" }`，进程不会因为坏输入退出。
+### 事件流
 
-```bash
-# 看一眼当前拓扑
-curl -s http://127.0.0.1:8787/api/state | jq '.state.pools[] | {name, strategy, members: (.members|length)}'
-
-# 暂停模拟器，然后手工打一条请求，观察它的逐跳轨迹
-curl -s -X POST http://127.0.0.1:8787/api/sim    -H 'content-type: application/json' -d '{"running":false}'
-curl -s -X POST http://127.0.0.1:8787/api/inject -H 'content-type: application/json' -d '{"count":1}' \
-  | jq '.traces[0] | {outcome, statusCode, path: [.path[] | "\(.kind):\(.name) — \(.reason)"]}'
-
-# 把某个池切成权重路由
-curl -s -X PATCH http://127.0.0.1:8787/api/entities/pool/pool_main \
-  -H 'content-type: application/json' -d '{"strategy":"weighted"}'
-```
-
-### WebSocket 事件
-
-连接后服务端立刻推一帧 `snapshot`，之后是增量事件（全部是 JSON 文本帧）：
+订阅时立刻收到一帧 `snapshot`，之后是增量事件（与旧 WebSocket 协议一致，见
+`shared/src/protocol.ts`）：
 
 ```ts
 type ServerEvent =
@@ -308,15 +288,15 @@ type ServerEvent =
       // 需要弹窗告知的事件（如代理停用级联），entityIds 渲染成可点击芯片
 ```
 
-前端把 trace 攒 100ms 批量入 store，因此边上的粒子和节点脉冲最多有一帧的延迟；
-断线后按 500ms → 5s 指数退避自动重连，顶栏的连接指示灯会跟着变。
+前端把 trace 攒 100ms 批量入 store，因此边上的粒子和节点脉冲最多有一帧的延迟。
 
 ---
 
 ## 一些实现上的取舍
 
-- **服务端是唯一状态源**。前端所有修改都走 REST，服务端回推 `patch`；
-  唯一的乐观更新是拖拽位置（本地立即生效 + 120ms 防抖写回），否则拖动会跟手很差。
+- **引擎是唯一状态源**。前端所有修改都走 `api.ts` 命令面，引擎回推 `patch`；
+  唯一的乐观更新是拖拽位置（本地立即生效再写回），否则拖动会跟手很差。
+  这层解耦让「浏览器内引擎」和「远程服务器」可以互换而 store 无感。
 - **指标是滚动估算**，不是精确统计：`rpm` 是平滑后的一位小数，`inFlight` 由利特尔法则推导，
   `metrics.history` 固定 40 个桶（每模拟秒滚动一次），`stats.timeline` 保留 60 个点。
 - **zustand v5 的选择器必须返回稳定引用**。store 里所有派生数据都用 `useMemo` 或

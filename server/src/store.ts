@@ -77,8 +77,11 @@ export interface StoreNotice {
 }
 export type StoreNoticeSink = (notice: StoreNotice) => void
 
-/** Dev-only invariant checks; a broken invariant warns, it never throws. */
-const CHECK_INVARIANTS = process.env.NODE_ENV !== 'production'
+/** Dev-only invariant checks; a broken invariant warns, it never throws.
+    Read through globalThis so the module runs in both Node and the browser. */
+const CHECK_INVARIANTS =
+  (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV !==
+  'production'
 
 /* ------------------------------------------------------------- coercion -- */
 

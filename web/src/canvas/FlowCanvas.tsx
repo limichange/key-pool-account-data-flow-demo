@@ -952,10 +952,10 @@ function CanvasInner(): JSX.Element {
           {offline ? (
             <div className="kpa-canvas__offline">
               <PlugZap size={26} />
-              <h2>无法连接到模拟器</h2>
+              <h2>模拟引擎未能启动</h2>
               <p>
-                网关模拟服务没有响应。请在项目根目录执行 <code>pnpm dev</code>，
-                确认 <code>127.0.0.1:8787</code> 已经启动后，页面会自动重连。
+                浏览器内的模拟引擎初始化失败。请刷新页面重试；若依旧失败，
+                打开开发者工具查看报错，或点击顶栏「重置」清除本地存储的演示状态。
               </p>
             </div>
           ) : (
